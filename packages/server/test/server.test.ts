@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { LanguageModel } from "ai";
 import { createApp } from "../src/app.js";
-import { SessionManager, type ModelResolver } from "../src/session-manager.js";
+import { SessionManager, SessionError, type ModelResolver } from "../src/session-manager.js";
 import { scriptedModel, errorPartModel, type ScriptStep } from "./mock-model.js";
 
 // ---- helpers ---------------------------------------------------------------
@@ -262,6 +262,149 @@ describe("snapshot + restore", () => {
     const fileRes = await a.request(`/v1/sessions/${restoredId}/fs/keep.txt`);
     expect(fileRes.status).toBe(200);
     expect(await fileRes.text()).toBe("persisted");
+  });
+});
+
+describe("cross-tenant + unowned snapshot restore (Fix 1)", () => {
+  const auth = (key: string): string | null => {
+    if (key === "key-alice") return "alice";
+    if (key === "key-bob") return "bob";
+    return null;
+  };
+
+  it("tenant B cannot restore tenant A's snapshot -> 403; A can -> 200 and sees the file", async () => {
+    const manager = new SessionManager({
+      modelResolver: resolverFor(scriptedModel([{ kind: "text", text: "x" }])),
+    });
+    const a = createApp({ manager, auth });
+
+    // Alice creates a session with a seeded file and snapshots it.
+    const c1 = await a.request("/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer key-alice" },
+      body: JSON.stringify({ model: "mock/x", files: { "/secret.txt": "alice-only" } }),
+    });
+    const { sessionId } = (await c1.json()) as { sessionId: string };
+    const snapRes = await a.request(`/v1/sessions/${sessionId}/snapshot`, {
+      method: "POST",
+      headers: { authorization: "Bearer key-alice" },
+    });
+    const { snapshotId } = (await snapRes.json()) as { snapshotId: string };
+    expect(snapshotId).toBeTruthy();
+
+    // Bob tries to restore Alice's snapshot -> 403 forbidden.
+    const bob = await a.request("/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer key-bob" },
+      body: JSON.stringify({ model: "mock/x", snapshotId }),
+    });
+    expect(bob.status).toBe(403);
+    const bobJson = (await bob.json()) as { error: { code: string } };
+    expect(bobJson.error.code).toBe("forbidden");
+
+    // Alice restores her own snapshot -> 200 and sees the file.
+    const alice = await a.request("/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer key-alice" },
+      body: JSON.stringify({ model: "mock/x", snapshotId }),
+    });
+    expect(alice.status).toBe(200);
+    const { sessionId: restoredId } = (await alice.json()) as { sessionId: string };
+    const fileRes = await a.request(`/v1/sessions/${restoredId}/fs/secret.txt`, {
+      headers: { authorization: "Bearer key-alice" },
+    });
+    expect(fileRes.status).toBe(200);
+    expect(await fileRes.text()).toBe("alice-only");
+  });
+
+  it("default-deny: restoring an unowned (never-issued) snapshotId -> 403", async () => {
+    const manager = new SessionManager({
+      modelResolver: resolverFor(scriptedModel([{ kind: "text", text: "x" }])),
+    });
+    const a = createApp({ manager });
+    const res = await a.request("/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/x", snapshotId: "deadbeef-not-a-real-snapshot" }),
+    });
+    expect(res.status).toBe(403);
+    const json = (await res.json()) as { error: { code: string } };
+    expect(json.error.code).toBe("forbidden");
+  });
+
+  it("allowUnownedRestore:true -> unknown hash falls through to 404 snapshot_not_found (not 500)", async () => {
+    const manager = new SessionManager({
+      modelResolver: resolverFor(scriptedModel([{ kind: "text", text: "x" }])),
+      allowUnownedRestore: true,
+    });
+    const a = createApp({ manager });
+    const res = await a.request("/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/x", snapshotId: "deadbeef-not-a-real-snapshot" }),
+    });
+    expect(res.status).toBe(404);
+    const json = (await res.json()) as { error: { code: string } };
+    expect(json.error.code).toBe("snapshot_not_found");
+  });
+});
+
+describe("per-session turn lock (Fix 2)", () => {
+  it("tryAcquireTurn is exclusive; releaseTurn frees it", () => {
+    const manager = new SessionManager({
+      modelResolver: resolverFor(scriptedModel([{ kind: "text", text: "x" }])),
+    });
+    const id = manager.create({ tenant: "default", model: "mock/x" });
+    expect(manager.tryAcquireTurn(id, "default")).toBe(true);
+    // Already busy.
+    expect(manager.tryAcquireTurn(id, "default")).toBe(false);
+    manager.releaseTurn(id);
+    // Freed again.
+    expect(manager.tryAcquireTurn(id, "default")).toBe(true);
+  });
+
+  it("tryAcquireTurn enforces tenant ownership (throws for wrong tenant)", () => {
+    const manager = new SessionManager({
+      modelResolver: resolverFor(scriptedModel([{ kind: "text", text: "x" }])),
+    });
+    const id = manager.create({ tenant: "alice", model: "mock/x" });
+    expect(() => manager.tryAcquireTurn(id, "bob")).toThrow(SessionError);
+  });
+
+  it("POST /messages while a turn is in flight -> 409 turn_in_flight", async () => {
+    const manager = new SessionManager({
+      modelResolver: resolverFor(scriptedModel([{ kind: "text", text: "x" }])),
+    });
+    const a = createApp({ manager });
+    const id = manager.create({ tenant: "default", model: "mock/x" });
+    // Simulate an in-flight turn by acquiring the lock out-of-band.
+    expect(manager.tryAcquireTurn(id, "default")).toBe(true);
+
+    const res = await a.request(`/v1/sessions/${id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi" }),
+    });
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { error: { code: string } };
+    expect(json.error.code).toBe("turn_in_flight");
+  });
+
+  it("a normal turn releases the lock so a subsequent turn succeeds", async () => {
+    const a = app({ resolver: resolverFor(scriptedModel([{ kind: "text", text: "ok" }])) });
+    const { sessionId } = await createSession(a, { model: "mock/x" });
+    const r1 = await a.request(`/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "first" }),
+    });
+    await parseSse(r1);
+    const r2 = await a.request(`/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "second" }),
+    });
+    expect(r2.status).toBe(200);
   });
 });
 

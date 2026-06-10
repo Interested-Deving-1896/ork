@@ -84,14 +84,26 @@ export function createApp(opts: CreateAppOptions): Hono {
     const limits = body.limits as never;
 
     if (typeof body.snapshotId === "string" && body.snapshotId.length > 0) {
-      const sessionId = await manager.restore({
-        tenant,
-        snapshotId: body.snapshotId,
-        model,
-        mounts,
-        network,
-        limits,
-      });
+      let sessionId: string;
+      try {
+        sessionId = await manager.restore({
+          tenant,
+          snapshotId: body.snapshotId,
+          model,
+          mounts,
+          network,
+          limits,
+        });
+      } catch (err) {
+        // Tenant/ownership rejections (SessionError 403) propagate to onError.
+        // A missing snapshot (KernelError ENOENT from the store) is a client
+        // error, not a 500 — and its raw message must not leak.
+        if (err instanceof SessionError) throw err;
+        if (isKernelError(err)) {
+          throw jsonError("snapshot_not_found", "snapshot not found", 404);
+        }
+        throw err;
+      }
       return c.json({ sessionId });
     }
 
@@ -121,6 +133,13 @@ export function createApp(opts: CreateAppOptions): Hono {
     }
     const prompt = body.prompt;
 
+    // Per-session turn lock: concurrent turns would interleave against the
+    // shared kernel FS and conversation history. Reject the second turn before
+    // opening the stream rather than corrupting state.
+    if (!manager.tryAcquireTurn(id, tenant)) {
+      throw jsonError("turn_in_flight", "a turn is already running for this session", 409);
+    }
+
     return streamSSE(c, async (stream) => {
       try {
         for await (const event of entry.session.send(prompt)) {
@@ -133,6 +152,8 @@ export function createApp(opts: CreateAppOptions): Hono {
           data: JSON.stringify({ type: "error", message: errText(err) }),
           event: "error",
         });
+      } finally {
+        manager.releaseTurn(id);
       }
     });
   });

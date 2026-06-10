@@ -28,6 +28,20 @@ export interface SessionManagerOptions {
   store?: SnapshotStore;
   /** Resolves a model id string to a LanguageModel. Defaults to identity. */
   modelResolver?: ModelResolver;
+  /**
+   * SECURITY DEFAULT (false): restore is only permitted for a snapshotId whose
+   * owning tenant this manager has recorded. The content-addressed store is
+   * keyed by hash only — an unguessable hash is NOT an authorization boundary —
+   * and the owner map lives in memory, so it is empty after a restart. With the
+   * default, an unowned snapshotId (never issued by this process, or issued
+   * before a restart) is rejected with 403 rather than silently restored.
+   *
+   * Set to true ONLY when restoring snapshots whose provenance is established
+   * out-of-band (e.g. a durable owner store, or a single-tenant deployment). In
+   * that mode an unowned snapshotId is allowed through to the store, where a
+   * truly-missing hash surfaces as a 404.
+   */
+  allowUnownedRestore?: boolean;
 }
 
 export interface CreateArgs {
@@ -54,9 +68,11 @@ interface Entry {
   tenant: string;
   lastUsed: number;
   snapshotId?: string;
+  /** Per-session in-flight turn lock; see tryAcquireTurn/releaseTurn. */
+  busy: boolean;
 }
 
-/** Raised by the manager when a lookup fails; carries an HTTP-ish status. */
+/** Raised by the manager when a lookup or authorization check fails; carries an HTTP-ish status. */
 export class SessionError extends Error {
   constructor(
     readonly status: 404 | 403,
@@ -70,12 +86,16 @@ export class SessionError extends Error {
 
 export class SessionManager {
   private readonly sessions = new Map<string, Entry>();
+  /** snapshotId -> owning tenant. In-memory; empty after a restart. */
+  readonly #snapshotOwners = new Map<string, string>();
   private readonly store: SnapshotStore;
   private readonly resolveModel: ModelResolver;
+  private readonly allowUnownedRestore: boolean;
 
   constructor(opts: SessionManagerOptions = {}) {
     this.store = opts.store ?? new MemorySnapshotStore();
     this.resolveModel = opts.modelResolver ?? identityResolver;
+    this.allowUnownedRestore = opts.allowUnownedRestore ?? false;
   }
 
   /** Create a fresh session and return its id. */
@@ -92,8 +112,25 @@ export class SessionManager {
     return this.store_(session, args.tenant);
   }
 
-  /** Restore a session from a snapshot and return the new session id. */
+  /**
+   * Restore a session from a snapshot and return the new session id.
+   *
+   * Enforces tenant-scoped restore: the content-addressed store is keyed by
+   * hash only, so ownership is tracked separately in #snapshotOwners. If the
+   * snapshotId has a recorded owner that is not the caller's tenant, throw 403.
+   * If it has NO recorded owner, default-deny with 403 unless the manager was
+   * constructed with allowUnownedRestore:true (see SessionManagerOptions).
+   */
   async restore(args: RestoreArgs): Promise<string> {
+    const owner = this.#snapshotOwners.get(args.snapshotId);
+    if (owner !== undefined) {
+      if (owner !== args.tenant) {
+        throw new SessionError(403, "forbidden", "snapshot belongs to another tenant");
+      }
+    } else if (!this.allowUnownedRestore) {
+      throw new SessionError(403, "forbidden", "unknown or unauthorized snapshot");
+    }
+
     const session = await restoreSession({
       store: this.store,
       snapshotId: args.snapshotId,
@@ -118,12 +155,32 @@ export class SessionManager {
     return entry;
   }
 
-  /** Snapshot a session, record and return the new snapshot id. */
+  /** Snapshot a session, record its owner, and return the new snapshot id. */
   async snapshot(sessionId: string, tenant: string): Promise<string> {
     const entry = this.get(sessionId, tenant);
     const { snapshotId } = await entry.session.snapshot(this.store);
     entry.snapshotId = snapshotId;
+    this.#snapshotOwners.set(snapshotId, entry.tenant);
     return snapshotId;
+  }
+
+  /**
+   * Acquire the per-session turn lock so concurrent turns to the same session
+   * cannot interleave against shared mutable kernel FS + messages. Enforces
+   * tenant ownership (throws SessionError like get()). Returns false if a turn
+   * is already in flight; the caller must NOT start a turn in that case.
+   */
+  tryAcquireTurn(sessionId: string, tenant: string): boolean {
+    const entry = this.get(sessionId, tenant);
+    if (entry.busy) return false;
+    entry.busy = true;
+    return true;
+  }
+
+  /** Release the per-session turn lock. No-op if the session is gone. */
+  releaseTurn(sessionId: string): void {
+    const entry = this.sessions.get(sessionId);
+    if (entry) entry.busy = false;
   }
 
   /**
@@ -136,6 +193,7 @@ export class SessionManager {
     try {
       const res = await entry.session.snapshot(this.store);
       snapshotId = res.snapshotId;
+      this.#snapshotOwners.set(snapshotId, entry.tenant);
     } catch {
       // Best-effort: a snapshot failure must not block eviction.
     }
@@ -145,7 +203,7 @@ export class SessionManager {
 
   private store_(session: Session, tenant: string, snapshotId?: string): string {
     const id = randomUUID();
-    this.sessions.set(id, { session, tenant, lastUsed: nowMs(), snapshotId });
+    this.sessions.set(id, { session, tenant, lastUsed: nowMs(), snapshotId, busy: false });
     return id;
   }
 }
