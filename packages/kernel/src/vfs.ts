@@ -85,4 +85,60 @@ export class Vfs {
   files(): IterableIterator<[string, Entry]> {
     return this.#entries.entries();
   }
+
+  readdir(path: string): string[] {
+    const p = normalizePath(path);
+    const e = this.entry(p);
+    if (e.kind !== "dir") throw new KernelError("ENOTDIR", p);
+    const prefix = p === "/" ? "/" : p + "/";
+    const names: string[] = [];
+    for (const key of this.#entries.keys()) {
+      if (key === p || !key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      if (!rest.includes("/")) names.push(rest);
+    }
+    return names.sort();
+  }
+
+  rm(path: string, opts: { recursive?: boolean } = {}): void {
+    const p = normalizePath(path);
+    if (p === "/") throw new KernelError("EINVAL", "cannot remove /");
+    const e = this.entry(p);
+    if (e.kind === "dir") {
+      const children = this.readdir(p);
+      if (children.length > 0 && !opts.recursive) throw new KernelError("ENOTEMPTY", p);
+      for (const child of children) this.rm(`${p}/${child}`, opts);
+    }
+    this.#entries.delete(p);
+  }
+
+  rename(from: string, to: string): void {
+    const f = normalizePath(from);
+    const t = normalizePath(to);
+    const e = this.entry(f);
+    const parentPath = parentOf(t);
+    const parent = this.#entries.get(parentPath);
+    if (!parent) throw new KernelError("ENOENT", `parent ${parentPath}`);
+    if (parent.kind !== "dir") throw new KernelError("ENOTDIR", parentPath);
+    const moves: Array<[string, string]> = [[f, t]];
+    if (e.kind === "dir") {
+      const prefix = f + "/";
+      for (const key of this.#entries.keys()) {
+        if (key.startsWith(prefix)) moves.push([key, t + key.slice(f.length)]);
+      }
+    }
+    for (const [oldKey, newKey] of moves) {
+      const entry = this.#entries.get(oldKey)!;
+      this.#entries.delete(oldKey);
+      this.#entries.set(newKey, entry);
+    }
+  }
+
+  totalBytes(): number {
+    let total = 0;
+    for (const e of this.#entries.values()) {
+      if (e.kind === "file") total += isLazy(e.content) ? e.content.size : e.content.byteLength;
+    }
+    return total;
+  }
 }
