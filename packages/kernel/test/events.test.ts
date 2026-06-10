@@ -21,3 +21,16 @@ test("unsubscribe stops delivery", () => {
   bus.emit({ type: "fs.write", path: "/a", bytes: 3 });
   expect(fn).not.toHaveBeenCalled();
 });
+
+test("a throwing listener does not break delivery nor the emitter", () => {
+  const bus = new EventBus();
+  const boom = vi.fn(() => {
+    throw new Error("listener bug");
+  });
+  const after = vi.fn();
+  bus.subscribe(boom);
+  bus.subscribe(after);
+  expect(() => bus.emit({ type: "proc.exit", pid: 1, exitCode: 0 })).not.toThrow();
+  expect(boom).toHaveBeenCalled();
+  expect(after).toHaveBeenCalled();
+});
