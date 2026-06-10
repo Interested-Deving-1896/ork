@@ -3,12 +3,27 @@
 // are NOT registered here.
 //
 // Command implementations live in ./commands/*: core.ts (echo/cat/pwd/true/
-// false/:/env/date/which) and test.ts (the POSIX test/[ evaluator). This module
-// just wires them together.
+// false/:/env/date/which), test.ts (the POSIX test/[ evaluator) and fs.ts (the
+// filesystem + text commands). This module just wires them together.
 
 import type { CommandImpl } from "./types.js";
 import { cat, date, echo, env, falseCmd, makeWhich, pwd, trueCmd } from "./commands/core.js";
 import { test } from "./commands/test.js";
+import {
+  base64Cmd,
+  cp,
+  cut,
+  head,
+  ls,
+  mkdir,
+  mv,
+  printf,
+  rm,
+  tail,
+  tee,
+  touch,
+  wc,
+} from "./commands/fs.js";
 
 export class CommandRegistry {
   #map = new Map<string, CommandImpl>();
@@ -48,6 +63,21 @@ export function defaultRegistry(): CommandRegistry {
   // test / [
   r.register("test", test);
   r.register("[", test);
+
+  // filesystem + text
+  r.register("ls", ls);
+  r.register("mkdir", mkdir);
+  r.register("rm", rm);
+  r.register("cp", cp);
+  r.register("mv", mv);
+  r.register("touch", touch);
+  r.register("head", head);
+  r.register("tail", tail);
+  r.register("wc", wc);
+  r.register("printf", printf);
+  r.register("tee", tee);
+  r.register("base64", base64Cmd);
+  r.register("cut", cut);
 
   // which: reports registered builtins + shell-state builtins.
   r.register("which", makeWhich((name) => r.has(name) || STATE_BUILTINS.has(name)));
