@@ -8,6 +8,34 @@ importers:
 
   .: {}
 
+  packages/harness:
+    dependencies:
+      '@ork/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@ork/shell':
+        specifier: workspace:*
+        version: link:../shell
+      '@ork/tools':
+        specifier: workspace:*
+        version: link:../tools
+      ai:
+        specifier: ^5.0.0
+        version: 5.0.197(zod@3.25.76)
+      zod:
+        specifier: ^3.23.0
+        version: 3.25.76
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.1
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.6(@types/node@24.13.1)
+
   packages/kernel:
     devDependencies:
       '@types/node':
