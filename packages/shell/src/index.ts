@@ -1,5 +1,8 @@
 export { parse } from "./parser.js";
-export { ShellParseError } from "./errors.js";
+export { ShellParseError, ShellError } from "./errors.js";
+export { Shell, type ShellOptions, type ExecResult } from "./interpreter.js";
+export { CommandRegistry, defaultRegistry } from "./registry.js";
+export type { CommandContext, CommandImpl } from "./types.js";
 export type {
   Script,
   Statement,
