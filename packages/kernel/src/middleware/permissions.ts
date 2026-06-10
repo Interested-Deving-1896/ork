@@ -11,6 +11,14 @@ export interface PermissionsConfig {
 
 export function permissionsMiddleware(cfg: PermissionsConfig): Middleware {
   const mounts = (cfg.mounts ?? []).map((m) => ({ mode: m.mode, path: normalizePath(m.path) }));
+  const allowedUrls = (cfg.network?.allowedUrlPrefixes ?? []).map((p) => {
+    try {
+      return new URL(p);
+    } catch {
+      throw new KernelError("EINVAL", `invalid url prefix: ${p}`);
+    }
+  });
+  const networkEnabled = cfg.network !== undefined;
 
   function isReadOnly(path: string): boolean {
     let best: { path: string; mode: "ro" | "rw" } | null = null;
@@ -25,10 +33,17 @@ export function permissionsMiddleware(cfg: PermissionsConfig): Middleware {
 
   return async (call, next) => {
     if (call.name === "fetch") {
-      const allowed = cfg.network?.allowedUrlPrefixes ?? [];
-      if (!allowed.some((prefix) => call.url!.startsWith(prefix))) {
-        throw new KernelError("ENETBLOCKED", call.url ?? "<no url>");
+      const raw = call.url ?? "";
+      let url: URL;
+      try {
+        url = new URL(raw);
+      } catch {
+        throw new KernelError("ENETBLOCKED", raw);
       }
+      const allowed =
+        networkEnabled &&
+        allowedUrls.some((p) => p.origin === url.origin && url.pathname.startsWith(p.pathname));
+      if (!allowed) throw new KernelError("ENETBLOCKED", raw);
       return next();
     }
     if (call.write) {

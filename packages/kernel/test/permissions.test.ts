@@ -42,3 +42,37 @@ test("fetch allowed only on allow-listed prefixes", async () => {
   await expect(sys.fetch("https://api.example.com/v1/x")).resolves.toBeInstanceOf(Response);
   await expect(sys.fetch("https://evil.com/")).rejects.toMatchObject({ code: "ENETBLOCKED" });
 });
+
+test("host-suffix attack blocked even without trailing slash in prefix", async () => {
+  const vfs = new Vfs({ now: () => 1 });
+  const fetchImpl = (async () => new Response("ok")) as typeof fetch;
+  const sys = createSyscalls({
+    vfs,
+    fetchImpl,
+    middlewares: [permissionsMiddleware({ network: { allowedUrlPrefixes: ["https://api.example.com"] } })],
+  });
+  await expect(sys.fetch("https://api.example.com.evil.com/")).rejects.toMatchObject({ code: "ENETBLOCKED" });
+  await expect(sys.fetch("https://api.example.com/v1")).resolves.toBeInstanceOf(Response);
+});
+
+test("path prefix is enforced via parsed pathname", async () => {
+  const vfs = new Vfs({ now: () => 1 });
+  const fetchImpl = (async () => new Response("ok")) as typeof fetch;
+  const sys = createSyscalls({
+    vfs,
+    fetchImpl,
+    middlewares: [permissionsMiddleware({ network: { allowedUrlPrefixes: ["https://api.example.com/v1/"] } })],
+  });
+  await expect(sys.fetch("https://api.example.com/v1/users")).resolves.toBeInstanceOf(Response);
+  await expect(sys.fetch("https://api.example.com/admin")).rejects.toMatchObject({ code: "ENETBLOCKED" });
+});
+
+test("unparseable URL → ENETBLOCKED; invalid configured prefix → EINVAL at construction", async () => {
+  const vfs = new Vfs({ now: () => 1 });
+  const sys = createSyscalls({
+    vfs,
+    middlewares: [permissionsMiddleware({ network: { allowedUrlPrefixes: ["https://ok.example.com/"] } })],
+  });
+  await expect(sys.fetch("not a url")).rejects.toMatchObject({ code: "ENETBLOCKED" });
+  expect(() => permissionsMiddleware({ network: { allowedUrlPrefixes: ["%%%"] } })).toThrowError(/EINVAL/);
+});
