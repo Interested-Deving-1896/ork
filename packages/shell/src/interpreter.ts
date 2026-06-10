@@ -51,6 +51,7 @@ const dec = new TextDecoder();
 
 const DEFAULT_MAX_LOOP_ITERATIONS = 100_000;
 const DEFAULT_MAX_COMMANDS = 100_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface ShellLimits {
   /** Max iterations any single loop (while/for) may run before aborting. */
@@ -64,6 +65,9 @@ export interface ShellOptions {
   env?: Record<string, string>;
   registry?: CommandRegistry;
   limits?: ShellLimits;
+  /** Per-pipeline wall-clock timeout (ms). On expiry the pipeline is torn down
+   * and exec() returns partial output with exit 124. Default 30_000. */
+  timeoutMs?: number;
 }
 
 // Thrown internally to abort an exec() run when an execution limit is hit. Not a
@@ -104,6 +108,7 @@ export class Shell {
   readonly #state: ShellState;
   readonly #maxLoopIterations: number;
   readonly #maxCommands: number;
+  readonly #timeoutMs: number;
   // Per-exec() command counter; reset at the start of each exec().
   #commandCount = 0;
   // Stdin available to in-process `read` while running a compound body fed by a
@@ -115,6 +120,7 @@ export class Shell {
     this.#registry = opts.registry ?? defaultRegistry();
     this.#maxLoopIterations = opts.limits?.maxLoopIterations ?? DEFAULT_MAX_LOOP_ITERATIONS;
     this.#maxCommands = opts.limits?.maxCommands ?? DEFAULT_MAX_COMMANDS;
+    this.#timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const env = new Map<string, string>();
     for (const [k, v] of Object.entries(opts.env ?? {})) env.set(k, v);
     if (!env.has("HOME")) env.set("HOME", "/");
@@ -123,11 +129,19 @@ export class Shell {
     this.#state = { cwd, env, lastExit: 0 };
   }
 
+  // Set when the command counter is exceeded inside a spawned proc (ctx.run /
+  // xargs). The proc wrapper swallows thrown errors into exit 1, so we record
+  // the limit here and re-raise it after the pipeline settles (see
+  // #runProcPipeline) to abort exec() cleanly at exit 2.
+  #limitHit: LimitError | null = null;
+
   // Increment the per-exec command counter; throw LimitError when exceeded.
   #countCommand(): void {
     this.#commandCount++;
     if (this.#commandCount > this.#maxCommands) {
-      throw new LimitError("ork-shell: command limit exceeded\n", 2);
+      const err = new LimitError("ork-shell: command limit exceeded\n", 2);
+      this.#limitHit = err;
+      throw err;
     }
   }
 
@@ -143,6 +157,7 @@ export class Shell {
     }
     const sink: OutputSink = { stdout: [], stderr: [] };
     this.#commandCount = 0;
+    this.#limitHit = null;
     try {
       await this.#runScript(ast, sink, 0);
     } catch (err) {
@@ -643,6 +658,20 @@ export class Shell {
       procHandles.push(handle);
     }
 
+    // For a non-last proc, does its stderr get merged into the downstream pipe?
+    // (2>&1 with no stdout-file redirect → stdout AND stderr feed next.stdin.)
+    const nonLastMergeToPipe = (i: number): boolean =>
+      i < procHandles.length - 1 &&
+      plans[i]!.mergeStderrToStdout &&
+      plans[i]!.stdoutFile === null;
+
+    // Teardown hooks for the inter-proc pipes we manage ourselves (one per
+    // connected pair). Calling a hook cancels the producer's stdout source and
+    // aborts the consumer's stdin, breaking backpressure so a blocked producer
+    // unwinds. We manage the pipe (rather than kernel.procs.pipe) precisely so
+    // we retain a handle to abort it for SIGPIPE-ish teardown and on timeout.
+    const pipeTeardowns: Array<() => void> = [];
+
     // Wire stdin for the first runnable proc and pipes between adjacent procs.
     // First proc stdin: heredoc / `< file` / empty.
     for (let i = 0; i < procHandles.length; i++) {
@@ -651,8 +680,11 @@ export class Shell {
       const plan = plans[i]!;
       const prev = i > 0 ? procHandles[i - 1] : null;
       if (prev) {
-        // Connect prev stdout → this stdin (kernel pipe semantics).
-        this.#kernel.procs.pipe(prev, handle);
+        // Connect prev stdout → this stdin. If prev has 2>&1 (and no stdout
+        // file), merge prev's stderr into the same pipe so the downstream stage
+        // sees both streams (Issue #3). Otherwise just its stdout.
+        const merge = nonLastMergeToPipe(i - 1);
+        pipeTeardowns.push(this.#pipeStreams(prev, handle, merge));
       } else {
         // First (or first-after-a-gap) proc: feed configured stdin then close.
         await this.#feedStdin(handle.stdin, plan);
@@ -673,6 +705,10 @@ export class Shell {
     // Collect output of every runnable proc and route it.
     let lastExit = 0;
     let lastWriteFailed = false;
+    let terminalDone: () => void = () => {};
+    const terminalResolved = new Promise<void>((r) => {
+      terminalDone = r;
+    });
     const collectors: Array<Promise<void>> = [];
     for (let i = 0; i < procHandles.length; i++) {
       const handle = procHandles[i];
@@ -696,17 +732,27 @@ export class Shell {
       // to ensure it drains. The kernel pipe (pipeTo) consumes it. For the last
       // proc (or any proc whose stdout is redirected to a file), we read here.
       const consumeStdout = isLast || plan.stdoutFile !== null;
+      // When a non-last proc's stderr is merged into the downstream pipe, we
+      // must NOT also drain it here (pipeMerged owns it); doing so would steal
+      // chunks. We still drain stderr otherwise so the proc can exit.
+      const stderrToPipe = nonLastMergeToPipe(i);
       const stdoutPromise = consumeStdout
         ? this.#collectStream(handle.stdout, stdoutChunks)
         : Promise.resolve();
-      const stderrPromise = this.#collectStream(handle.stderr, stderrChunks);
+      const stderrPromise = stderrToPipe
+        ? Promise.resolve()
+        : this.#collectStream(handle.stderr, stderrChunks);
 
       collectors.push(
         (async () => {
           const code = await handle.exit;
           await stdoutPromise;
           await stderrPromise;
-          if (isLast) lastExit = code;
+          if (isLast) {
+            lastExit = code;
+            // Terminal proc done: signal upstream teardown (Issue #1b).
+            terminalDone();
+          }
           // Route stdout.
           if (consumeStdout) {
             let outText = dec.decode(concat(stdoutChunks));
@@ -720,7 +766,7 @@ export class Shell {
               sink.stdout.push(outText);
             }
           }
-          // Route stderr (unless merged into stdout above).
+          // Route stderr (unless merged into stdout above, or fed to the pipe).
           if (!plan.mergeStderrToStdout) {
             const errText = dec.decode(concat(stderrChunks));
             if (plan.stderrFile) {
@@ -729,19 +775,113 @@ export class Shell {
             } else {
               sink.stderr.push(errText);
             }
-          } else if (!consumeStdout) {
-            // merged but stdout went to the next proc via pipe: still capture
-            // stderr into the pipe is not modeled; append stderr to sink stdout.
-            sink.stdout.push(dec.decode(concat(stderrChunks)));
           }
+          // else: mergeStderrToStdout — for a non-last stage stderr went into
+          // the pipe (stderrToPipe) and is handled downstream; for a consumed
+          // stage it was appended to outText above.
         })(),
       );
     }
-    await Promise.all(collectors);
 
-    if (lastWriteFailed) lastExit = 1;
+    // Issue #1b — proactive upstream teardown. Once the terminal proc has
+    // exited and its output is collected, tear down every inter-proc pipe:
+    // this cancels each producer's stdout source and aborts each consumer's
+    // stdin, releasing any producer blocked on stdout backpressure so its exit
+    // resolves and Promise.all(collectors) does not wait on it forever.
+    const teardownPipes = (): void => {
+      for (const t of pipeTeardowns) t();
+    };
+    void terminalResolved.then(teardownPipes);
+
+    // Issue #1a — wall-clock backstop. Race the collectors against a timer; on
+    // timeout, tear down every proc's streams so nothing stays pending, then
+    // return partial output with exit 124. clearTimeout in finally so no
+    // dangling timer keeps the event loop alive.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), this.#timeoutMs);
+    });
+    try {
+      const all = Promise.all(collectors).then(() => "done" as const);
+      const winner = await Promise.race([all, timeout]);
+      if (winner === "timeout") {
+        timedOut = true;
+        // Tear down every inter-proc pipe (releases backpressure) and cancel
+        // any streams we still own so nothing stays pending. We do NOT await
+        // the collectors here: a proc whose main never returns (e.g. an
+        // infinite await) would keep Promise.all pending forever. A bare
+        // pending promise does not keep the Node event loop alive, so leaving
+        // collectors unawaited is safe and the process/test still exits.
+        teardownPipes();
+        for (const h of procHandles) {
+          if (!h) continue;
+          // For the terminal/file-collected proc we own the readable side.
+          void h.stdout.cancel().catch(() => {});
+          void h.stderr.cancel().catch(() => {});
+        }
+        sink.stderr.push("ork-shell: pipeline timed out\n");
+        lastExit = 124;
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+
+    // If a spawned proc (ctx.run/xargs) hit the command limit, abort exec()
+    // cleanly: re-raise past the proc wrapper so exec()'s top-level handler
+    // emits the message on stderr at exit 2 (Issue #2).
+    if (this.#limitHit && !timedOut) throw this.#limitHit;
+
+    if (!timedOut && lastWriteFailed) lastExit = 1;
     this.#state.lastExit = lastExit;
     return lastExit;
+  }
+
+  // Connect `from`'s stdout (and, when `merge`, its stderr — for a non-last
+  // 2>&1 stage, Issue #3) into `to`'s stdin. Unlike the kernel's fire-and-forget
+  // pipe, we drive the pump with our own reader/writer so we can tear it down:
+  // the returned function cancels the source reader(s) and aborts the dest
+  // writer, releasing a producer blocked on backpressure (SIGPIPE-ish, Issue
+  // #1). Closes `to`'s stdin once the source(s) drain. Errors are swallowed.
+  #pipeStreams(
+    from: ReturnType<Kernel["procs"]["spawn"]>,
+    to: ReturnType<Kernel["procs"]["spawn"]>,
+    merge: boolean,
+  ): () => void {
+    const writer = to.stdin.getWriter();
+    const outReader = from.stdout.getReader();
+    const errReader = merge ? from.stderr.getReader() : null;
+
+    const pump = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        if (value) await writer.write(value);
+      }
+    };
+
+    void (async () => {
+      try {
+        const pumps = [pump(outReader)];
+        if (errReader) pumps.push(pump(errReader));
+        await Promise.all(pumps);
+        await writer.close();
+      } catch {
+        try {
+          await writer.abort();
+        } catch {
+          /* ignore */
+        }
+      }
+    })();
+
+    // Teardown: cancel sources (unblocks the producer's writes) and abort the
+    // dest. Each is best-effort; locking/closed-state errors are ignored.
+    return () => {
+      void outReader.cancel().catch(() => {});
+      void errReader?.cancel().catch(() => {});
+      void writer.abort().catch(() => {});
+    };
   }
 
   // ---- one-off command spawn (ctx.run) ------------------------------------
@@ -754,6 +894,14 @@ export class Shell {
     env: ReadonlyMap<string, string>,
     stdin: string,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    // Check the command counter BEFORE spawning so hitting the limit aborts the
+    // whole exec() cleanly (exit 2) rather than leaking the limit message into
+    // the spawning command's output. We record the limit and return a quiet
+    // non-zero sentinel; #runProcPipeline re-raises it past the proc wrapper.
+    if (this.#commandCount + 1 > this.#maxCommands) {
+      this.#limitHit ??= new LimitError("ork-shell: command limit exceeded\n", 2);
+      return { stdout: "", stderr: "", exitCode: 2 };
+    }
     this.#countCommand();
     const name = argv[0];
     if (name === undefined) return { stdout: "", stderr: "", exitCode: 0 };
