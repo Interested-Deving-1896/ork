@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createTools } from "../src/index.js";
-import { makeCtx } from "./helpers.js";
+import { makeCtx, readBack } from "./helpers.js";
 
 // A minimal ToolCallOptions-shaped object to satisfy execute()'s signature.
 const callOpts = { toolCallId: "test-call", messages: [] } as never;
@@ -65,5 +65,52 @@ describe("createTools", () => {
     const tools = createTools(ctx);
     const out = await tools.Grep.execute!({ pattern: "needle" }, callOpts);
     expect(out).toBe("/a.ts");
+  });
+
+  it("Grep.execute returns an Error string (not a throw) for an invalid regex", async () => {
+    const { ctx } = makeCtx({ "/a.ts": "x\n" });
+    const tools = createTools(ctx);
+    // execute must resolve to a string, never reject.
+    const out = await tools.Grep.execute!({ pattern: "(" }, callOpts);
+    expect(out).toMatch(/^Error:/);
+  });
+
+  it("Write.execute returns an Error string (not a throw) when target is a directory; dir stays intact", async () => {
+    const { ctx, kernel } = makeCtx({ "/d/keep.txt": "orig" });
+    const tools = createTools(ctx);
+    const out = await tools.Write.execute!({ file_path: "/d", content: "x" }, callOpts);
+    expect(out).toMatch(/^Error:/);
+    // Directory and its contents are untouched.
+    expect((await kernel.sys.stat("/d")).kind).toBe("dir");
+    expect(await readBack(kernel, "/d/keep.txt")).toBe("orig");
+  });
+
+  it("Grep.execute files_with_matches output is lexicographically sorted", async () => {
+    const { ctx } = makeCtx({
+      "/m.txt": "hit\n",
+      "/a/early.txt": "hit\n",
+      "/z/late.txt": "hit\n",
+    });
+    const tools = createTools(ctx);
+    const out = await tools.Grep.execute!(
+      { pattern: "hit", output_mode: "files_with_matches" },
+      callOpts,
+    );
+    expect(out).toBe("/a/early.txt\n/m.txt\n/z/late.txt");
+  });
+
+  it("Read.execute returns a string (not a throw) on a directory path", async () => {
+    const { ctx } = makeCtx({ "/d/keep.txt": "orig" });
+    const tools = createTools(ctx);
+    const out = await tools.Read.execute!({ file_path: "/d" }, callOpts);
+    expect(typeof out).toBe("string");
+    expect(out).toContain("directory");
+  });
+
+  it("Bash.execute returns a string (not a throw) on a failing command", async () => {
+    const { ctx } = makeCtx();
+    const tools = createTools(ctx);
+    const out = await tools.Bash.execute!({ command: "cat /does/not/exist" }, callOpts);
+    expect(typeof out).toBe("string");
   });
 });

@@ -49,47 +49,62 @@ export interface OrkTools {
 }
 
 /**
+ * Wrap an async tool body so it NEVER throws: any thrown value (a plain Error, a
+ * KernelError surfaced by lazy hydration, an EditError, a RegExp SyntaxError,
+ * EISDIR, …) is turned into a model-correctable string `Error: <message>`.
+ * Without this, a throw escapes into the harness loop and crashes it instead of
+ * giving the model something it can read and recover from.
+ */
+function safeExecute<I>(fn: (input: I) => Promise<string>): (input: I) => Promise<string> {
+  return async (input) => {
+    try {
+      return await fn(input);
+    } catch (err) {
+      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  };
+}
+
+/**
  * Wrap the core tool functions as AI SDK tools bound to `ctx`. The model calls
- * these; tests should prefer the exported core functions directly.
+ * these; tests should prefer the exported core functions directly. Every
+ * `execute` is guarded by {@link safeExecute} so it always resolves to a string
+ * and never throws into the agent loop.
  */
 export function createTools(ctx: ToolContext): OrkTools {
   return {
     Bash: tool({
       description: DESCRIPTIONS.Bash,
       inputSchema: bashInputSchema,
-      execute: async (input) => (await bashTool(input, ctx)).output,
+      execute: safeExecute(async (input: BashInput) => (await bashTool(input, ctx)).output),
     }),
     Read: tool({
       description: DESCRIPTIONS.Read,
       inputSchema: readInputSchema,
-      execute: async (input) => (await readFileTool(input, ctx)).output,
+      execute: safeExecute(async (input: ReadInput) => (await readFileTool(input, ctx)).output),
     }),
     Write: tool({
       description: DESCRIPTIONS.Write,
       inputSchema: writeInputSchema,
-      execute: async (input) => (await writeFileTool(input, ctx)).output,
+      execute: safeExecute(async (input: WriteInput) => (await writeFileTool(input, ctx)).output),
     }),
     Edit: tool({
       description: DESCRIPTIONS.Edit,
       inputSchema: editInputSchema,
-      execute: async (input) => {
-        try {
-          return (await editFileTool(input, ctx)).output;
-        } catch (err) {
-          if (err instanceof EditError) return `Error: ${err.message}`;
-          throw err;
-        }
-      },
+      // EditError already carries a clean, model-facing message; the uniform
+      // wrapper renders it the same way (`Error: <message>`), so no special case
+      // is needed here.
+      execute: safeExecute(async (input: EditInput) => (await editFileTool(input, ctx)).output),
     }),
     Glob: tool({
       description: DESCRIPTIONS.Glob,
       inputSchema: globInputSchema,
-      execute: async (input) => (await globTool(input, ctx)).output,
+      execute: safeExecute(async (input: GlobInput) => (await globTool(input, ctx)).output),
     }),
     Grep: tool({
       description: DESCRIPTIONS.Grep,
       inputSchema: grepInputSchema,
-      execute: async (input) => (await grepTool(input, ctx)).output,
+      execute: safeExecute(async (input: GrepInput) => (await grepTool(input, ctx)).output),
     }),
   };
 }

@@ -67,6 +67,9 @@ export async function grepTool(input: GrepInput, ctx: ToolContext): Promise<Grep
   const globRe = input.glob ? globToRegExp(input.glob) : null;
 
   let files = await walkFiles(ctx, root);
+  // Sort lexicographically so output is deterministic and agrees with Glob's
+  // ordering, regardless of the VFS walk order.
+  files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (globRe) {
     files = files.filter((f) => {
       // Match the glob against the basename and the path-relative-to-root, so
