@@ -23,6 +23,7 @@ export class MemorySnapshotStore implements SnapshotStore {
   #trees = new Map<string, string>(); // JSON sérialisé, immuable
 
   async putBlob(hash: string, data: Uint8Array): Promise<void> {
+    // Le blob est stocké par référence : le caller ne doit pas muter le buffer après put.
     this.#blobs.set(hash, data);
   }
   async getBlob(hash: string): Promise<Uint8Array | null> {

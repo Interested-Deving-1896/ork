@@ -47,3 +47,31 @@ test("DiskSnapshotStore blob + tree round-trip", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("DiskSnapshotStore rejects traversal-shaped ids", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ork-store-"));
+  try {
+    const store = new DiskSnapshotStore(dir);
+    await expect(store.putBlob("../evil", enc.encode("x"))).rejects.toMatchObject({ code: "EINVAL" });
+    await expect(store.getBlob("a/b")).rejects.toMatchObject({ code: "EINVAL" });
+    await expect(store.putTree("../../tree", { version: 1, entries: {} })).rejects.toMatchObject({ code: "EINVAL" });
+    await expect(store.getTree("..")).rejects.toMatchObject({ code: "EINVAL" });
+    await expect(store.hasBlob("with space")).rejects.toMatchObject({ code: "EINVAL" });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DiskSnapshotStore surfaces corruption instead of returning null", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ork-store-"));
+  try {
+    const store = new DiskSnapshotStore(dir);
+    await store.putTree("snap1", { version: 1, entries: {} });
+    const { writeFile: wf } = await import("node:fs/promises");
+    await wf(join(dir, "trees", "snap1.json"), "{corrupt");
+    await expect(store.getTree("snap1")).rejects.toThrow();
+    expect(await store.getTree("missing")).toBeNull(); // ENOENT reste null
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
