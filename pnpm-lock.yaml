@@ -24,6 +24,40 @@ importers:
         specifier: ^4.22.4
         version: 4.22.4
 
+  example:
+    dependencies:
+      '@hono/node-server':
+        specifier: ^1.13.0
+        version: 1.19.14(hono@4.12.25)
+      '@ork/harness':
+        specifier: workspace:*
+        version: link:../packages/harness
+      '@ork/kernel':
+        specifier: workspace:*
+        version: link:../packages/kernel
+      '@ork/server':
+        specifier: workspace:*
+        version: link:../packages/server
+      '@ork/shell':
+        specifier: workspace:*
+        version: link:../packages/shell
+      '@ork/tools':
+        specifier: workspace:*
+        version: link:../packages/tools
+      ai:
+        specifier: ^5.0.0
+        version: 5.0.197(zod@3.25.76)
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.1
+      tsx:
+        specifier: ^4.22.4
+        version: 4.22.4
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
+
   packages/harness:
     dependencies:
       '@ork/kernel':
