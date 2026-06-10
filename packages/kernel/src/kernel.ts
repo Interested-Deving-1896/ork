@@ -10,7 +10,8 @@ import { restoreVfs, snapshotVfs } from "./snapshot/snapshot.js";
 import type { SnapshotStore } from "./snapshot/store.js";
 
 export interface KernelOptions {
-  /** Fichiers initiaux. Les dossiers parents sont créés automatiquement. */
+  /** Fichiers initiaux. Les dossiers parents sont créés automatiquement.
+   *  Seedés hors quotas : leurs octets comptent ensuite dans maxFsBytes. */
   files?: Record<string, string | Uint8Array>;
   mounts?: PermissionsConfig["mounts"];
   network?: PermissionsConfig["network"];
@@ -72,6 +73,8 @@ export function createKernel(opts: KernelOptions = {}): Kernel {
   return buildKernel(vfs, opts);
 }
 
+/** La config (limits/mounts/network) est fournie à chaque instanciation : le snapshot
+ *  ne persiste que le FS et `meta` (ex. historique de conversation), jamais la config. */
 export async function restoreKernel(
   args: { store: SnapshotStore; snapshotId: string } & KernelOptions,
 ): Promise<{ kernel: Kernel; meta?: unknown }> {

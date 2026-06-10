@@ -5,6 +5,8 @@ import type { ManifestEntry, SnapshotManifest, SnapshotStore } from "./store.js"
 
 const enc = new TextEncoder();
 
+/** L'id est le sha256 du manifest JSON : même FS + même meta ⇒ même id. Attention :
+ *  l'ordre des clés d'un `meta` objet compte — canonicalisez-le côté appelant. */
 export async function snapshotVfs(
   vfs: Vfs,
   store: SnapshotStore,
