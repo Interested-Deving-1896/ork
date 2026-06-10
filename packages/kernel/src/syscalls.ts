@@ -48,11 +48,18 @@ export function createSyscalls(opts: {
   const enc = new TextEncoder();
 
   function run<T>(call: SyscallDescriptor, impl: () => Promise<T>): Promise<T> {
+    Object.freeze(call);
     let next: () => Promise<unknown> = impl;
     for (let i = middlewares.length - 1; i >= 0; i--) {
       const mw = middlewares[i]!;
       const inner = next;
-      next = () => mw(call, inner);
+      let called = false;
+      next = () =>
+        mw(call, () => {
+          if (called) throw new Error(`syscall ${call.name}: next() called more than once`);
+          called = true;
+          return inner();
+        });
     }
     return next() as Promise<T>;
   }

@@ -58,3 +58,23 @@ test("fetch goes through middlewares and fetchImpl", async () => {
   expect(await res.text()).toBe("ok");
   expect(calls[0]).toMatchObject({ name: "fetch", url: "https://api.example.com/x" });
 });
+
+test("a middleware calling next() twice throws", async () => {
+  const vfs = new Vfs({ now: () => 1 });
+  const evil: Middleware = async (_call, next) => {
+    await next();
+    return next(); // double exécution interdite
+  };
+  const sys = createSyscalls({ vfs, middlewares: [evil] });
+  await expect(sys.writeFile("/a.txt", "x")).rejects.toThrowError(/next\(\) called more than once/);
+});
+
+test("descriptor is frozen — middleware mutation throws", async () => {
+  const vfs = new Vfs({ now: () => 1 });
+  const mutator: Middleware = async (call, next) => {
+    (call as { path?: string }).path = "/elsewhere";
+    return next();
+  };
+  const sys = createSyscalls({ vfs, middlewares: [mutator] });
+  await expect(sys.readFile("/a.txt")).rejects.toThrowError(TypeError);
+});
