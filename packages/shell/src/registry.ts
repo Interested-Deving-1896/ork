@@ -24,6 +24,7 @@ import {
   touch,
   wc,
 } from "./commands/fs.js";
+import { diff, find, grep, jq, sed, sort, tr, uniq, xargs } from "./commands/text.js";
 
 export class CommandRegistry {
   #map = new Map<string, CommandImpl>();
@@ -78,6 +79,17 @@ export function defaultRegistry(): CommandRegistry {
   r.register("tee", tee);
   r.register("base64", base64Cmd);
   r.register("cut", cut);
+
+  // text processing
+  r.register("grep", grep);
+  r.register("sort", sort);
+  r.register("uniq", uniq);
+  r.register("tr", tr);
+  r.register("sed", sed);
+  r.register("find", find);
+  r.register("xargs", xargs);
+  r.register("diff", diff);
+  r.register("jq", jq);
 
   // which: reports registered builtins + shell-state builtins.
   r.register("which", makeWhich((name) => r.has(name) || STATE_BUILTINS.has(name)));

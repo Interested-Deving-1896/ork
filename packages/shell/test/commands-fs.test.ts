@@ -363,7 +363,7 @@ describe("which", () => {
 
   it("unknown name → exit 1, no output", async () => {
     const { shell } = sh();
-    const r = await shell.exec("which jq");
+    const r = await shell.exec("which nosuchtool");
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
   });

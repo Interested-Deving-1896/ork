@@ -73,8 +73,8 @@ export const date: CommandImpl = async (ctx) => {
 
 // which: this shell has no PATH; it reports registered builtins only. For each
 // name, print the name on its own line if it is a known builtin; otherwise print
-// nothing for that name and exit non-zero overall. Useful for agent probes like
-// `which jq` (which will fail, signalling the tool is unavailable).
+// nothing for that name and exit non-zero overall. Useful for agent probes that
+// check whether a tool is available before invoking it.
 export function makeWhich(isBuiltin: (name: string) => boolean): CommandImpl {
   return async (ctx: CommandContext) => {
     const names = ctx.argv.slice(1);
