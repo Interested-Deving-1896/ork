@@ -79,10 +79,11 @@ function buildSession(
     messages.push({ role: "user", content: prompt });
 
     // Optional compaction before the call (no-op when tokenBudget unset).
+    // compact() always returns a fresh array, so splicing it back into the live
+    // `messages` reference is safe even on short-circuit paths (no aliasing wipe).
     if (cfg.tokenBudget !== undefined) {
       const compacted = compact(messages, cfg.tokenBudget);
-      messages.length = 0;
-      messages.push(...compacted);
+      messages.splice(0, messages.length, ...compacted);
     }
 
     let accumulatedText = "";

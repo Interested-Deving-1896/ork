@@ -113,6 +113,34 @@ describe("multi-turn", () => {
     expect(session.messages.length).toBeGreaterThan(afterTurn1);
   });
 
+  it("preserves conversation across turns when tokenBudget is set and turns are under budget", async () => {
+    const model = scriptedModel([
+      // turn 1
+      { kind: "tools", calls: [{ toolName: "Write", input: { file_path: "/state.txt", content: "v1" } }] },
+      { kind: "text", text: "wrote", finishReason: "stop" },
+      // turn 2
+      { kind: "tools", calls: [{ toolName: "Read", input: { file_path: "/state.txt" } }] },
+      { kind: "text", text: "saw v1", finishReason: "stop" },
+    ]);
+    // Large budget => every turn is under budget (the normal case).
+    const session = createSession({ model, tokenBudget: 1_000_000 });
+
+    await collect(session.send("write state"));
+    // Conversation must survive compaction, not be wiped to [].
+    expect(session.messages.length).toBeGreaterThan(0);
+    const afterTurn1 = session.messages.length;
+    const firstPrompt = session.messages[0];
+    expect(firstPrompt && firstPrompt.content).toBe("write state");
+
+    const events2 = await collect(session.send("read state"));
+    // Turn 2 still runs (messages were not emptied) and sees turn-1 context.
+    const readResult = events2.find((e) => e.type === "tool_result");
+    expect(readResult && readResult.type === "tool_result" && readResult.output).toContain("v1");
+    expect(session.messages.length).toBeGreaterThan(afterTurn1);
+    // Turn-1 user prompt still present.
+    expect(session.messages[0] && session.messages[0].content).toBe("write state");
+  });
+
   it("the user prompt is recorded in messages", async () => {
     const model = scriptedModel([{ kind: "text", text: "ok", finishReason: "stop" }]);
     const session = createSession({ model });
