@@ -1,0 +1,24 @@
+// Runtime command context handed to every CommandImpl. A command is a small
+// program: it reads stdin, writes stdout/stderr, and returns an exit code. It
+// resolves paths against the launching cwd via ctx.resolve() (the kernel
+// syscalls themselves are cwd-agnostic), and reads the environment snapshot
+// captured when the pipeline was launched.
+
+import type { FsSyscalls } from "@ork/kernel";
+
+export interface CommandContext {
+  /** argv[0] is the command name. */
+  argv: string[];
+  stdin: ReadableStream<Uint8Array>;
+  stdout: WritableStream<Uint8Array>;
+  stderr: WritableStream<Uint8Array>;
+  sys: FsSyscalls;
+  /** Resolved absolute working directory at launch time. */
+  cwd: string;
+  /** Environment snapshot (shell env + per-command prefix overlay). */
+  env: ReadonlyMap<string, string>;
+  /** Resolve a (possibly relative) path against cwd: normalizePath(path, cwd). */
+  resolve(path: string): string;
+}
+
+export type CommandImpl = (ctx: CommandContext) => Promise<number>;
