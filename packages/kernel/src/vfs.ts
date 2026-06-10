@@ -57,6 +57,15 @@ export class Vfs {
     this.#entries.set(p, { kind: "file", content, mtime: this.#now() });
   }
 
+  /** Installe un fichier non hydraté (restore lazy). Le parent doit exister. */
+  putLazyFile(path: string, ref: LazyRef, mtime: number): void {
+    const p = normalizePath(path);
+    const parent = this.#entries.get(parentOf(p));
+    if (!parent) throw new KernelError("ENOENT", `parent ${parentOf(p)}`);
+    if (parent.kind !== "dir") throw new KernelError("ENOTDIR", parentOf(p));
+    this.#entries.set(p, { kind: "file", content: ref, mtime });
+  }
+
   stat(path: string): Stat {
     const e = this.entry(path);
     if (e.kind === "dir") return { kind: "dir", size: 0, mtime: e.mtime };
