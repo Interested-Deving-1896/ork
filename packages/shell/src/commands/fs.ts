@@ -3,42 +3,11 @@
 // Conventions: errors go to stderr as "<cmd>: <detail>"; exit 0 ok, 1 error,
 // 2 usage. Paths are resolved against ctx.cwd via ctx.resolve().
 
-import { basename, isKernelError, parentOf, readAll, readText, writeAll } from "@ork/kernel";
+import { basename, isKernelError, readAll, readText, writeAll } from "@ork/kernel";
 import type { CommandContext, CommandImpl } from "../types.js";
+import { parseFlags, parseRangeList, statOrNull, takeLines } from "./util.js";
 
 const dec = new TextDecoder();
-
-/** Small flag parser: collects single-char flags from clustered/separate args
- * (e.g. `-la`, `-l -a`) until the first non-flag or `--`. Returns the flag set
- * plus the remaining operands (in order). Flags taking values are not handled
- * here — commands that need them (head/tail/wc/cut) parse explicitly. */
-function parseFlags(
-  args: string[],
-  known: Set<string>,
-): { flags: Set<string>; rest: string[] } {
-  const flags = new Set<string>();
-  const rest: string[] = [];
-  let i = 0;
-  for (; i < args.length; i++) {
-    const a = args[i]!;
-    if (a === "--") {
-      i++;
-      break;
-    }
-    if (a.length > 1 && a.startsWith("-")) {
-      let ok = true;
-      const chars = a.slice(1).split("");
-      for (const c of chars) if (!known.has(c)) ok = false;
-      if (ok) {
-        for (const c of chars) flags.add(c);
-        continue;
-      }
-    }
-    break;
-  }
-  for (; i < args.length; i++) rest.push(args[i]!);
-  return { flags, rest };
-}
 
 // ---- ls --------------------------------------------------------------------
 // ls [-l] [-a] [-1] [paths...]. No path → cwd. A file path lists just its name.
@@ -328,19 +297,6 @@ function parseN(args: string[]): { n: number; files: string[]; err?: string } {
     }
   }
   return { n, files };
-}
-
-function takeLines(text: string, n: number, tail: boolean): string {
-  if (text === "") return "";
-  // Split keeping the structure; a trailing newline yields a final "" we drop.
-  const hadTrailing = text.endsWith("\n");
-  const body = hadTrailing ? text.slice(0, -1) : text;
-  const lines = body.split("\n");
-  const picked = tail ? lines.slice(Math.max(0, lines.length - n)) : lines.slice(0, n);
-  if (picked.length === 0) return "";
-  // Re-attach a trailing newline if the slice reaches the original end OR the
-  // input had one. For head not reaching the end we still terminate the line.
-  return picked.join("\n") + "\n";
 }
 
 function makeHeadTail(cmd: "head" | "tail"): CommandImpl {
@@ -658,38 +614,3 @@ export const cut: CommandImpl = async (ctx) => {
   return code;
 };
 
-/** Parse a cut LIST into a 1-based membership predicate, or null if invalid. */
-function parseRangeList(list: string): ((i: number) => boolean) | null {
-  const ranges: Array<[number, number]> = [];
-  for (const part of list.split(",")) {
-    if (part === "") continue;
-    let m: RegExpMatchArray | null;
-    if ((m = part.match(/^(\d+)$/))) {
-      const n = parseInt(m[1]!, 10);
-      ranges.push([n, n]);
-    } else if ((m = part.match(/^(\d+)-$/))) {
-      ranges.push([parseInt(m[1]!, 10), Infinity]);
-    } else if ((m = part.match(/^-(\d+)$/))) {
-      ranges.push([1, parseInt(m[1]!, 10)]);
-    } else if ((m = part.match(/^(\d+)-(\d+)$/))) {
-      ranges.push([parseInt(m[1]!, 10), parseInt(m[2]!, 10)]);
-    } else {
-      return null;
-    }
-  }
-  if (ranges.length === 0) return null;
-  return (i: number) => ranges.some(([lo, hi]) => i >= lo && i <= hi);
-}
-
-// ---- helpers ---------------------------------------------------------------
-async function statOrNull(
-  ctx: CommandContext,
-  abs: string,
-): Promise<import("@ork/kernel").Stat | null> {
-  try {
-    return await ctx.sys.stat(abs);
-  } catch (err) {
-    if (isKernelError(err) && err.code === "ENOENT") return null;
-    throw err;
-  }
-}

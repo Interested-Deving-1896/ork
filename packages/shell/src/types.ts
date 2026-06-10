@@ -19,6 +19,10 @@ export interface CommandContext {
   env: ReadonlyMap<string, string>;
   /** Resolve a (possibly relative) path against cwd: normalizePath(path, cwd). */
   resolve(path: string): string;
+  /** Spawn a one-off command through the registry with the current cwd/env,
+   * feeding `stdin`, and collecting its output. Used by commands that need to
+   * run other builtins (e.g. xargs). Bounded by the same command counter. */
+  run?(argv: string[], stdin?: string): Promise<{ stdout: string; stderr: string; exitCode: number }>;
 }
 
 export type CommandImpl = (ctx: CommandContext) => Promise<number>;

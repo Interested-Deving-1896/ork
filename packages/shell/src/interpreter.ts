@@ -623,6 +623,7 @@ export class Shell {
         cwd: this.#state.cwd,
         env: plan.env,
         resolve: (p: string) => normalizePath(p, this.#state.cwd),
+        run: (argv: string[], stdin?: string) => this.#runOneOff(argv, plan.env, stdin ?? ""),
       };
       const handle = this.#kernel.procs.spawn(plan.argv, async (io) => {
         const ctx: CommandContext = {
@@ -741,6 +742,62 @@ export class Shell {
     if (lastWriteFailed) lastExit = 1;
     this.#state.lastExit = lastExit;
     return lastExit;
+  }
+
+  // ---- one-off command spawn (ctx.run) ------------------------------------
+
+  // Spawn a single registered command as a proc with the current cwd and the
+  // given env overlay, feed it `stdin`, and collect stdout/stderr. Bounded by
+  // the same per-exec command counter so xargs etc. cannot run unbounded.
+  async #runOneOff(
+    argv: string[],
+    env: ReadonlyMap<string, string>,
+    stdin: string,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    this.#countCommand();
+    const name = argv[0];
+    if (name === undefined) return { stdout: "", stderr: "", exitCode: 0 };
+    const impl = this.#registry.get(name);
+    if (!impl) {
+      return { stdout: "", stderr: `ork-shell: ${name}: command not found\n`, exitCode: 127 };
+    }
+    const cwd = this.#state.cwd;
+    const ctx0: Omit<CommandContext, "stdin" | "stdout" | "stderr"> = {
+      argv,
+      sys: this.#kernel.sys,
+      cwd,
+      env,
+      resolve: (p: string) => normalizePath(p, cwd),
+      run: (a: string[], s?: string) => this.#runOneOff(a, env, s ?? ""),
+    };
+    const handle = this.#kernel.procs.spawn(argv, async (io) => {
+      const ctx: CommandContext = {
+        ...ctx0,
+        argv: io.argv,
+        stdin: io.stdin,
+        stdout: io.stdout,
+        stderr: io.stderr,
+      };
+      try {
+        return await impl(ctx);
+      } catch (err) {
+        await this.#writeStderr(io.stderr, this.#formatCmdError(name, err));
+        return this.#errorExitCode(err);
+      }
+    });
+    const stdoutChunks: Uint8Array[] = [];
+    const stderrChunks: Uint8Array[] = [];
+    await this.#feedStdin(handle.stdin, { heredoc: stdin, stdinFile: null });
+    const outP = this.#collectStream(handle.stdout, stdoutChunks);
+    const errP = this.#collectStream(handle.stderr, stderrChunks);
+    const exitCode = await handle.exit;
+    await outP;
+    await errP;
+    return {
+      stdout: dec.decode(concat(stdoutChunks)),
+      stderr: dec.decode(concat(stderrChunks)),
+      exitCode,
+    };
   }
 
   // ---- stdin feeding -------------------------------------------------------
