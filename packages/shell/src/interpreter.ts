@@ -1,8 +1,16 @@
 // The interpreter executes a parsed Script over a @ork/kernel instance.
 //
-// Scope (Shell 2): pipelines of SIMPLE commands only. Compound commands
-// (if/while/for) parse but throw a "not implemented yet" ShellError here
-// (caught and surfaced as exitCode 2 with a message — see exec()).
+// Scope: pipelines of simple commands PLUS compound commands (if/while/for).
+// A compound runs its inner Scripts via the statement-execution path, routing
+// output through the pipeline's sinks and honoring its trailing redirections.
+// Compounds are supported standalone or as the LAST stage of a pipeline (e.g.
+// `seq | while read ...`); a compound in any earlier pipeline position throws a
+// ShellError (surfaced as exitCode 2). The in-process `read` builtin consumes a
+// shell-level stdin buffer the compound sets up from the pipe or `< file`.
+//
+// Execution limits (ShellOptions.limits) guard against runaway agent scripts:
+// a per-exec() command counter (maxCommands) and a per-loop iteration counter
+// (maxLoopIterations); exceeding either aborts exec() with exitCode 2.
 //
 // Key model:
 //  - The Shell holds mutable state: cwd + env + lastExit.
@@ -26,11 +34,14 @@ import {
 } from "./expand.js";
 import type {
   AndOr,
+  ForNode,
+  IfNode,
   Pipeline,
   Redirection,
   Script,
   SimpleCommand,
   Statement,
+  WhileNode,
   Word,
 } from "./ast.js";
 import type { CommandContext } from "./types.js";
@@ -38,10 +49,34 @@ import type { CommandContext } from "./types.js";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+const DEFAULT_MAX_LOOP_ITERATIONS = 100_000;
+const DEFAULT_MAX_COMMANDS = 100_000;
+
+export interface ShellLimits {
+  /** Max iterations any single loop (while/for) may run before aborting. */
+  maxLoopIterations?: number;
+  /** Max simple-command/compound executions per exec() call. */
+  maxCommands?: number;
+}
+
 export interface ShellOptions {
   cwd?: string;
   env?: Record<string, string>;
   registry?: CommandRegistry;
+  limits?: ShellLimits;
+}
+
+// Thrown internally to abort an exec() run when an execution limit is hit. Not a
+// ShellError (which maps to a generic "ork-shell: <msg>" prefix); carries the
+// exact stderr text and exit code to surface.
+class LimitError extends Error {
+  constructor(
+    readonly stderrText: string,
+    readonly code: number,
+  ) {
+    super(stderrText);
+    this.name = "LimitError";
+  }
 }
 
 export interface ExecResult {
@@ -67,16 +102,33 @@ export class Shell {
   readonly #kernel: Kernel;
   readonly #registry: CommandRegistry;
   readonly #state: ShellState;
+  readonly #maxLoopIterations: number;
+  readonly #maxCommands: number;
+  // Per-exec() command counter; reset at the start of each exec().
+  #commandCount = 0;
+  // Stdin available to in-process `read` while running a compound body fed by a
+  // pipe / `< file`. null when no piped stdin is in scope.
+  #stdinBuffer: { text: string; pos: number } | null = null;
 
   constructor(kernel: Kernel, opts: ShellOptions = {}) {
     this.#kernel = kernel;
     this.#registry = opts.registry ?? defaultRegistry();
+    this.#maxLoopIterations = opts.limits?.maxLoopIterations ?? DEFAULT_MAX_LOOP_ITERATIONS;
+    this.#maxCommands = opts.limits?.maxCommands ?? DEFAULT_MAX_COMMANDS;
     const env = new Map<string, string>();
     for (const [k, v] of Object.entries(opts.env ?? {})) env.set(k, v);
     if (!env.has("HOME")) env.set("HOME", "/");
     const cwd = normalizePath(opts.cwd ?? "/");
     env.set("PWD", cwd);
     this.#state = { cwd, env, lastExit: 0 };
+  }
+
+  // Increment the per-exec command counter; throw LimitError when exceeded.
+  #countCommand(): void {
+    this.#commandCount++;
+    if (this.#commandCount > this.#maxCommands) {
+      throw new LimitError("ork-shell: command limit exceeded\n", 2);
+    }
   }
 
   async exec(script: string): Promise<ExecResult> {
@@ -90,10 +142,14 @@ export class Shell {
       throw err;
     }
     const sink: OutputSink = { stdout: [], stderr: [] };
+    this.#commandCount = 0;
     try {
       await this.#runScript(ast, sink, 0);
     } catch (err) {
-      if (err instanceof ShellError) {
+      if (err instanceof LimitError) {
+        sink.stderr.push(err.stderrText);
+        this.#state.lastExit = err.code;
+      } else if (err instanceof ShellError) {
         sink.stderr.push(`ork-shell: ${err.message}\n`);
         this.#state.lastExit = 2;
       } else {
@@ -148,11 +204,35 @@ export class Shell {
   async #runPipeline(pipeline: Pipeline, sink: OutputSink, cmdsubDepth: number): Promise<number> {
     const cmds = pipeline.commands;
     if (cmds.length === 0) return 0;
-    for (const c of cmds) {
-      if (c.kind !== "simple") {
-        throw new ShellError(`compound command '${c.kind}' not implemented yet`);
+
+    // Compounds may appear only as a standalone single-command pipeline OR as
+    // the LAST stage of a pipeline (e.g. `seq | while read ...`). A compound in
+    // any non-final position is unsupported.
+    for (let i = 0; i < cmds.length - 1; i++) {
+      if (cmds[i]!.kind !== "simple") {
+        throw new ShellError(
+          `compound command '${cmds[i]!.kind}' is only supported as the last stage of a pipeline`,
+        );
       }
     }
+
+    const last = cmds[cmds.length - 1]!;
+    if (last.kind !== "simple") {
+      // Pipeline ending in a compound. If there are upstream stages, run them as
+      // a proc pipeline capturing their stdout, then feed it as the compound's
+      // stdin (consumed by the `read` builtin).
+      let stdin = "";
+      if (cmds.length > 1) {
+        const upstream = cmds.slice(0, -1) as SimpleCommand[];
+        const buf: OutputSink = { stdout: [], stderr: [] };
+        await this.#runProcPipeline(upstream, buf, cmdsubDepth);
+        // Upstream stderr still goes to the real sink.
+        for (const s of buf.stderr) sink.stderr.push(s);
+        stdin = buf.stdout.join("");
+      }
+      return this.#runCompound(last, sink, cmdsubDepth, stdin);
+    }
+
     const simples = cmds as SimpleCommand[];
 
     // A single simple command may be a shell-state builtin (cd/assignment/export)
@@ -164,6 +244,162 @@ export class Shell {
     }
 
     return this.#runProcPipeline(simples, sink, cmdsubDepth);
+  }
+
+  // ---- compound commands (if / while / for) --------------------------------
+
+  // Execute a compound node, routing its body/cond output through `sink`,
+  // honoring the node's trailing redirections, and making `stdin` available to
+  // the `read` builtin during execution.
+  async #runCompound(
+    node: IfNode | WhileNode | ForNode,
+    sink: OutputSink,
+    cmdsubDepth: number,
+    stdin: string,
+  ): Promise<number> {
+    this.#countCommand();
+
+    const redirs = node.redirections;
+    // When the compound has output redirections, run its body into a private
+    // buffer and route afterwards (mirrors simple-command redirection handling).
+    const hasOutRedir = redirs.some((r) => r.op === ">" || r.op === ">>" || r.op === "2>&1");
+    const stdinRedir = redirs.find((r) => r.op === "<");
+
+    // `< file` on the compound overrides any piped stdin.
+    if (stdinRedir) {
+      const rt = this.#runtime(cmdsubDepth, this.#state.env);
+      const file = await expandRedirTarget(stdinRedir.target!, rt);
+      const resolved = normalizePath(file, this.#state.cwd);
+      try {
+        stdin = dec.decode(await this.#kernel.sys.readFile(resolved));
+      } catch (err) {
+        if (isKernelError(err) && err.code === "ENOENT") {
+          sink.stderr.push(`ork-shell: ${file}: No such file or directory\n`);
+          this.#state.lastExit = 1;
+          return 1;
+        }
+        throw err;
+      }
+    }
+
+    const target = hasOutRedir ? { stdout: [] as string[], stderr: [] as string[] } : sink;
+
+    // Install stdin for any `read` builtins encountered while running the body.
+    const savedStdin = this.#stdinBuffer;
+    this.#stdinBuffer = { text: stdin, pos: 0 };
+    let code: number;
+    try {
+      if (node.kind === "if") code = await this.#runIf(node, target, cmdsubDepth);
+      else if (node.kind === "while") code = await this.#runWhile(node, target, cmdsubDepth);
+      else code = await this.#runFor(node, target, cmdsubDepth);
+    } finally {
+      this.#stdinBuffer = savedStdin;
+    }
+
+    if (hasOutRedir) {
+      await this.#routeCompoundRedir(redirs, target as OutputSink, sink, cmdsubDepth);
+    }
+
+    this.#state.lastExit = code;
+    return code;
+  }
+
+  async #runIf(node: IfNode, sink: OutputSink, cmdsubDepth: number): Promise<number> {
+    for (const clause of node.clauses) {
+      const condCode = await this.#runScriptReturningExit(clause.cond, sink, cmdsubDepth);
+      if (condCode === 0) {
+        return this.#runScriptReturningExit(clause.body, sink, cmdsubDepth);
+      }
+    }
+    if (node.elseBody) {
+      return this.#runScriptReturningExit(node.elseBody, sink, cmdsubDepth);
+    }
+    // No clause matched and no else: exit 0.
+    return 0;
+  }
+
+  async #runWhile(node: WhileNode, sink: OutputSink, cmdsubDepth: number): Promise<number> {
+    let code = 0;
+    let iterations = 0;
+    for (;;) {
+      const condCode = await this.#runScriptReturningExit(node.cond, sink, cmdsubDepth);
+      if (condCode !== 0) break;
+      if (++iterations > this.#maxLoopIterations) {
+        throw new LimitError("ork-shell: loop iteration limit exceeded\n", 2);
+      }
+      code = await this.#runScriptReturningExit(node.body, sink, cmdsubDepth);
+    }
+    return code;
+  }
+
+  async #runFor(node: ForNode, sink: OutputSink, cmdsubDepth: number): Promise<number> {
+    const rt = this.#runtime(cmdsubDepth, this.#state.env);
+    const values = await expandWords(node.items, rt);
+    let code = 0;
+    let iterations = 0;
+    for (const value of values) {
+      if (++iterations > this.#maxLoopIterations) {
+        throw new LimitError("ork-shell: loop iteration limit exceeded\n", 2);
+      }
+      this.#state.env.set(node.varName, value);
+      code = await this.#runScriptReturningExit(node.body, sink, cmdsubDepth);
+    }
+    return code;
+  }
+
+  // Run a Script (a sequence of statements) and return the exit code of the
+  // last-executed statement. Background statements are awaited before return.
+  async #runScriptReturningExit(
+    script: Script,
+    sink: OutputSink,
+    cmdsubDepth: number,
+  ): Promise<number> {
+    const background: Array<Promise<void>> = [];
+    for (const stmt of script.statements) {
+      await this.#runStatement(stmt, sink, cmdsubDepth, background);
+    }
+    await Promise.all(background);
+    return this.#state.lastExit;
+  }
+
+  // Route a compound's buffered output to its redirection targets. Mirrors the
+  // simple-command routing: `2>&1` merges stderr into stdout (and the stdout
+  // target/sink), `>`/`>>` to files, otherwise to the shared sink.
+  async #routeCompoundRedir(
+    redirs: Redirection[],
+    buf: OutputSink,
+    sink: OutputSink,
+    cmdsubDepth: number,
+  ): Promise<void> {
+    const rt = this.#runtime(cmdsubDepth, this.#state.env);
+    const merge = redirs.some((r) => r.op === "2>&1");
+    let stdoutTarget: { path: string; append: boolean } | null = null;
+    let stderrTarget: { path: string; append: boolean } | null = null;
+    for (const r of redirs) {
+      if (r.op === ">" || r.op === ">>") {
+        const file = await expandRedirTarget(r.target!, rt);
+        const dest = { path: normalizePath(file, this.#state.cwd), append: r.op === ">>" };
+        if (r.fd === 2) stderrTarget = dest;
+        else stdoutTarget = dest;
+      }
+    }
+
+    let outText = buf.stdout.join("");
+    const errText = buf.stderr.join("");
+    if (merge) outText += errText;
+
+    if (stdoutTarget) {
+      await this.#writeToFile(stdoutTarget, outText, sink);
+    } else {
+      sink.stdout.push(outText);
+    }
+    if (!merge) {
+      if (stderrTarget) {
+        await this.#writeToFile(stderrTarget, errText, sink);
+      } else {
+        sink.stderr.push(errText);
+      }
+    }
   }
 
   // ---- shell-state builtins (in-process) ----------------------------------
@@ -179,6 +415,7 @@ export class Shell {
 
     // Assignment-only command (no words): set shell env, expand values.
     if (cmd.words.length === 0 && cmd.assignments.length > 0) {
+      this.#countCommand();
       for (const a of cmd.assignments) {
         const value = await expandWordSingle(a.value, rt);
         this.#state.env.set(a.name, value);
@@ -193,10 +430,39 @@ export class Shell {
     // builtins-after-expansion subtlety does not matter for cd/export, which are
     // always written as bare literals in practice.
     const name = staticLiteral(cmd.words[0]!);
-    if (name === "cd") return this.#builtinCd(cmd, sink, rt);
-    if (name === "export") return this.#builtinExport(cmd, rt);
+    if (name === "cd") {
+      this.#countCommand();
+      return this.#builtinCd(cmd, sink, rt);
+    }
+    if (name === "export") {
+      this.#countCommand();
+      return this.#builtinExport(cmd, rt);
+    }
+    if (name === "read") return this.#builtinRead(cmd, rt);
 
     return null;
+  }
+
+  // read VAR: consume one line from the in-scope stdin buffer, strip the
+  // trailing newline, assign to VAR. EOF (no buffer or buffer exhausted) → no
+  // assignment and exit 1. Without a VAR argument, reads into REPLY.
+  async #builtinRead(cmd: SimpleCommand, rt: ExpandRuntime): Promise<number> {
+    this.#countCommand();
+    const fields = await expandWords(cmd.words, rt);
+    const varName = fields[1] ?? "REPLY";
+    const buf = this.#stdinBuffer;
+    if (!buf || buf.pos >= buf.text.length) return 1;
+    let nl = buf.text.indexOf("\n", buf.pos);
+    let line: string;
+    if (nl === -1) {
+      line = buf.text.slice(buf.pos);
+      buf.pos = buf.text.length;
+    } else {
+      line = buf.text.slice(buf.pos, nl);
+      buf.pos = nl + 1;
+    }
+    this.#state.env.set(varName, line);
+    return 0;
   }
 
   async #builtinCd(cmd: SimpleCommand, sink: OutputSink, rt: ExpandRuntime): Promise<number> {
@@ -269,6 +535,7 @@ export class Shell {
 
     const plans: Plan[] = [];
     for (const cmd of cmds) {
+      this.#countCommand();
       // Per-command env = shell env + prefix assignments (overlay).
       const env = new Map(this.#state.env);
       const tracker = { lastCmdsubExit: null as number | null };

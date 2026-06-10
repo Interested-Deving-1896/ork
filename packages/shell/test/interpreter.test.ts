@@ -350,11 +350,11 @@ describe("interpreter: errors and edge cases", () => {
     expect(r.stderr).toMatch(/^ork-shell: /);
   });
 
-  it("compound commands return exitCode 2 with a not-implemented message", async () => {
+  it("compound commands now execute (control flow implemented)", async () => {
     const { shell } = sh();
     const r = await shell.exec("if true; then echo y; fi");
-    expect(r.exitCode).toBe(2);
-    expect(r.stderr).toContain("not implemented yet");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("y\n");
   });
 
   it("background command output appears (exec awaits background)", async () => {
