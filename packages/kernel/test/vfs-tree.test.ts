@@ -57,3 +57,37 @@ test("totalBytes sums file sizes", () => {
   const vfs = seeded();
   expect(vfs.totalBytes()).toBe(6); // "aa" + "bbbb"
 });
+
+test("rename into own subtree → EINVAL", () => {
+  const vfs = seeded();
+  expect(() => vfs.rename("/work", "/work/sub")).toThrowError(/EINVAL/);
+  expect(() => vfs.rename("/work", "/work/sub/deep")).toThrowError(/EINVAL/);
+  // l'arbre est intact
+  expect(vfs.exists("/work/a.txt")).toBe(true);
+  expect(vfs.exists("/work/sub/b.txt")).toBe(true);
+});
+
+test("rename onto existing dir → EEXIST", () => {
+  const vfs = seeded();
+  vfs.mkdir("/other");
+  expect(() => vfs.rename("/work", "/other")).toThrowError(/EEXIST/);
+});
+
+test("rename dir onto existing file → ENOTDIR", () => {
+  const vfs = seeded();
+  expect(() => vfs.rename("/work/sub", "/work/a.txt")).toThrowError(/ENOTDIR/);
+});
+
+test("rename file onto existing file overwrites", async () => {
+  const vfs = seeded();
+  vfs.writeFile("/work/target.txt", enc.encode("old"));
+  vfs.rename("/work/a.txt", "/work/target.txt");
+  expect(dec.decode(await vfs.readFile("/work/target.txt"))).toBe("aa");
+  expect(vfs.exists("/work/a.txt")).toBe(false);
+});
+
+test("self-rename is a no-op", async () => {
+  const vfs = seeded();
+  vfs.rename("/work/a.txt", "/work/a.txt");
+  expect(dec.decode(await vfs.readFile("/work/a.txt"))).toBe("aa");
+});

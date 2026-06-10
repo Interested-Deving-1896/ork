@@ -116,6 +116,16 @@ export class Vfs {
     const f = normalizePath(from);
     const t = normalizePath(to);
     const e = this.entry(f);
+    if (f === t) return;
+    if (t === f || t.startsWith(f === "/" ? "/" : f + "/")) {
+      throw new KernelError("EINVAL", `cannot move ${f} into itself`);
+    }
+    const target = this.#entries.get(t);
+    if (target) {
+      if (target.kind === "dir") throw new KernelError("EEXIST", t);
+      if (e.kind === "dir") throw new KernelError("ENOTDIR", t);
+      // from=file, to=file existant : écrasement silencieux, sémantique POSIX assumée
+    }
     const parentPath = parentOf(t);
     const parent = this.#entries.get(parentPath);
     if (!parent) throw new KernelError("ENOENT", `parent ${parentPath}`);
