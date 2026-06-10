@@ -11,6 +11,9 @@ export function traceMiddleware(bus: EventBus): Middleware {
       if (call.name === "writeFile" && call.path !== undefined && call.bytes !== undefined) {
         bus.emit({ type: "fs.write", path: call.path, bytes: call.bytes });
       }
+      if (call.name === "fetch" && call.url !== undefined) {
+        bus.emit({ type: "net.fetch", url: call.url, method: call.method ?? "GET", status: (result as Response).status });
+      }
       return result;
     } catch (err) {
       bus.emit({

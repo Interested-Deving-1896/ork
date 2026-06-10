@@ -68,3 +68,16 @@ test("snapshot of a restored-lazy vfs reuses hashes without hydrating", async ()
 test("restore unknown id → ENOENT", async () => {
   await expect(restoreVfs(new MemorySnapshotStore(), "nope")).rejects.toMatchObject({ code: "ENOENT" });
 });
+
+test("tampered blob fails integrity check on hydration", async () => {
+  const store = new MemorySnapshotStore();
+  const vfs = seeded();
+  const { snapshotId } = await snapshotVfs(vfs, store);
+  // empoisonne le blob de a.txt ("alpha")
+  const manifest = (await store.getTree(snapshotId))!;
+  const entry = manifest.entries["/work/a.txt"]!;
+  if (entry.kind !== "file") throw new Error("expected file");
+  await store.putBlob(entry.hash, enc.encode("TAMPERED"));
+  const { vfs: restored } = await restoreVfs(store, snapshotId);
+  await expect(restored.readFile("/work/a.txt")).rejects.toMatchObject({ code: "EINVAL" });
+});

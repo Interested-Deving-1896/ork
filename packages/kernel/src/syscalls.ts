@@ -19,6 +19,8 @@ export interface SyscallDescriptor {
   toPath?: string;
   /** URL pour fetch. */
   url?: string;
+  /** Méthode HTTP pour fetch (normalisée en majuscules). */
+  method?: string;
   /** Taille du payload pour writeFile. */
   bytes?: number;
   /** L'appel mute-t-il le FS ? */
@@ -88,6 +90,9 @@ export function createSyscalls(opts: {
         async () => vfs.rename(from, to),
       ),
     fetch: (url, init) =>
-      run({ name: "fetch", url, write: false }, () => fetchImpl(url, init)),
+      run(
+        { name: "fetch", url, method: (init?.method ?? "GET").toUpperCase(), write: false },
+        () => fetchImpl(url, init),
+      ),
   };
 }

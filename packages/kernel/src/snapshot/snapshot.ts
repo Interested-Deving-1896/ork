@@ -47,6 +47,8 @@ export async function restoreVfs(
   vfs.hydrator = async (hash) => {
     const data = await store.getBlob(hash);
     if (!data) throw new KernelError("ENOENT", `blob ${hash}`);
+    const actual = await sha256Hex(data);
+    if (actual !== hash) throw new KernelError("EINVAL", `blob ${hash}: integrity check failed`);
     return data;
   };
   const paths = Object.keys(manifest.entries).sort(); // parents avant enfants

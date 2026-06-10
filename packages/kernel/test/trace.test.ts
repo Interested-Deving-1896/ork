@@ -37,3 +37,26 @@ test("permission denials are traced (trace is outermost)", async () => {
   await expect(sys.writeFile("/ro/x.txt", "x")).rejects.toMatchObject({ code: "EACCES" });
   expect(events).toContainEqual({ type: "syscall", name: "writeFile", path: "/ro/x.txt", ok: false, code: "EACCES" });
 });
+
+test("fetch emits a typed net.fetch event with method and status", async () => {
+  const vfs = new Vfs({ now: () => 1 });
+  const bus = new EventBus();
+  const events: KernelEvent[] = [];
+  bus.subscribe((ev) => events.push(ev));
+  const fetchImpl = (async () => new Response("ok", { status: 201 })) as typeof fetch;
+  const sys = createSyscalls({
+    vfs,
+    fetchImpl,
+    middlewares: [
+      traceMiddleware(bus),
+      permissionsMiddleware({ network: { allowedUrlPrefixes: ["https://api.example.com/"] } }),
+    ],
+  });
+  await sys.fetch("https://api.example.com/x", { method: "post" });
+  expect(events).toContainEqual({
+    type: "net.fetch",
+    url: "https://api.example.com/x",
+    method: "POST",
+    status: 201,
+  });
+});
