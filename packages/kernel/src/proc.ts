@@ -109,6 +109,13 @@ export class ProcTable {
     return handle;
   }
 
+  /** Connecte stdout de `from` au stdin de `to`. Fire-and-forget : la fin du
+   *  producteur ferme le stdin du consommateur. Les erreurs de pipe (consommateur
+   *  mort) sont volontairement avalées — sémantique SIGPIPE simplifiée. */
+  pipe(from: ProcHandle, to: ProcHandle): void {
+    void from.stdout.pipeTo(to.stdin).catch(() => {});
+  }
+
   wait(pid: number): Promise<number> {
     const record = this.#procs.get(pid);
     if (!record) throw new KernelError("ENOENT", `pid ${pid}`);
