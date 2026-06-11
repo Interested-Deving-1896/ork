@@ -21,3 +21,14 @@ export { MemorySnapshotStore, type SnapshotStore, type SnapshotManifest, type Ma
 export { DiskSnapshotStore } from "./snapshot/disk-store.js";
 export { snapshotVfs, restoreVfs } from "./snapshot/snapshot.js";
 export { createKernel, restoreKernel, type Kernel, type KernelOptions } from "./kernel.js";
+export {
+  MemoryPointerStore,
+  type PointerStore,
+  type WorkspacePointer,
+} from "./workspace/pointer-store.js";
+export { DiskPointerStore } from "./workspace/disk-pointer-store.js";
+export {
+  Workspace,
+  WorkspaceConflictError,
+  type WorkspaceOpenOptions,
+} from "./workspace/workspace.js";
