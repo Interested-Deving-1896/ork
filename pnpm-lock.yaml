@@ -48,6 +48,9 @@ importers:
         specifier: ^5.0.0
         version: 5.0.197(zod@3.25.76)
     devDependencies:
+      '@ai-sdk/provider':
+        specifier: 2.0.3
+        version: 2.0.3
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.1
