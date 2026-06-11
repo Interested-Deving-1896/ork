@@ -6,7 +6,7 @@
 
 import { isKernelError, readText, writeAll } from "@ork/kernel";
 import type { CommandContext, CommandImpl } from "../types.js";
-import { splitLines, statOrNull } from "./util.js";
+import { parseOpts, splitLines, statOrNull } from "./util.js";
 
 const dec = new TextDecoder();
 
@@ -46,21 +46,9 @@ function escapeRegExp(s: string): string {
 // files or recursively. No files → stdin. Exit 0 if any match, 1 if none, 2 on
 // bad regex.
 export const grep: CommandImpl = async (ctx) => {
-  const args = ctx.argv.slice(1);
-  const flags = new Set<string>();
-  const operands: string[] = [];
-  let stop = false;
-  for (const a of args) {
-    if (!stop && a === "--") {
-      stop = true;
-      continue;
-    }
-    if (!stop && a.length > 1 && a.startsWith("-") && /^-[ivncrlEFo]+$/.test(a)) {
-      for (const c of a.slice(1)) flags.add(c);
-    } else {
-      operands.push(a);
-    }
-  }
+  const parsed = parseOpts(ctx.argv.slice(1), { bool: "ivncrlEFo" });
+  const flags = parsed.flags;
+  const operands = parsed.positional;
   if (operands.length === 0) {
     await writeAll(ctx.stderr, "grep: usage: grep [options] PATTERN [files...]\n");
     return 2;
@@ -190,41 +178,26 @@ async function walkFiles(
 // Sort lines from stdin or the concatenation of files. `-n` numeric, `-r`
 // reverse, `-u` drop duplicate output lines (after sort), `-k N` sort by the
 // 1-based field N (whitespace-split by default, `-t C` custom 1-char delim).
-// Sort is stable.
+// Value flags accept BOTH POSIX forms: `-t , -k 2` and attached `-t, -k2`
+// (and clusters like `-nr`). Sort is stable.
 export const sort: CommandImpl = async (ctx) => {
-  const args = ctx.argv.slice(1);
-  let numeric = false;
-  let reverse = false;
-  let unique = false;
+  const opts = parseOpts(ctx.argv.slice(1), { bool: "rnu", value: "kt" });
+  const numeric = opts.flags.has("n");
+  const reverse = opts.flags.has("r");
+  const unique = opts.flags.has("u");
   let key: number | null = null;
-  let delim: string | null = null;
-  const files: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]!;
-    if (a === "--") {
-      for (let j = i + 1; j < args.length; j++) files.push(args[j]!);
-      break;
+  if (opts.values.has("k")) {
+    // `-k N[,M...]` — we honor the leading field number only.
+    const raw = opts.values.get("k")!;
+    const n = parseInt(raw, 10);
+    if (Number.isNaN(n)) {
+      await writeAll(ctx.stderr, `sort: invalid key: ${raw}\n`);
+      return 2;
     }
-    if (a === "-k") {
-      const v = args[++i];
-      const n = v === undefined ? NaN : parseInt(v, 10);
-      if (Number.isNaN(n)) {
-        await writeAll(ctx.stderr, `sort: invalid key: ${v ?? ""}\n`);
-        return 2;
-      }
-      key = n;
-    } else if (a === "-t") {
-      delim = args[++i] ?? null;
-    } else if (a.length > 1 && a.startsWith("-") && /^-[rnu]+$/.test(a)) {
-      for (const c of a.slice(1)) {
-        if (c === "r") reverse = true;
-        else if (c === "n") numeric = true;
-        else if (c === "u") unique = true;
-      }
-    } else {
-      files.push(a);
-    }
+    key = n;
   }
+  const delim: string | null = opts.values.get("t") ?? null;
+  const files = opts.positional;
 
   let text: string;
   if (files.length === 0) {
@@ -587,6 +560,10 @@ export const sed: CommandImpl = async (ctx) => {
         scripts.push(v);
         scriptTaken = true;
       }
+    } else if (a.startsWith("-e") && a.length > 2) {
+      // attached form: -e's/a/b/'
+      scripts.push(a.slice(2));
+      scriptTaken = true;
     } else if (a.length > 1 && a.startsWith("-") && /^-[nEr]+$/.test(a)) {
       for (const c of a.slice(1)) {
         if (c === "n") suppress = true;

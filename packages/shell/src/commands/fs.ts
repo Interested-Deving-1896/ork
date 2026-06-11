@@ -5,7 +5,7 @@
 
 import { basename, isKernelError, readAll, readText, writeAll } from "@ork/kernel";
 import type { CommandContext, CommandImpl } from "../types.js";
-import { parseFlags, parseRangeList, statOrNull, takeLines } from "./util.js";
+import { parseFlags, parseOpts, parseRangeList, statOrNull, takeLines } from "./util.js";
 
 const dec = new TextDecoder();
 
@@ -278,6 +278,8 @@ export const touch: CommandImpl = async (ctx) => {
 // ---- head / tail -----------------------------------------------------------
 // head [-n N] [files...] / tail [-n N] [files...]. Default N=10. No files →
 // stdin. Multiple files → bash-style "==> name <==" headers separated by blanks.
+// Count accepts `-n N`, attached `-nN`, and the historic shorthand `-N`
+// (e.g. `head -20` ≡ `head -n 20`).
 function parseN(args: string[]): { n: number; files: string[]; err?: string } {
   let n = 10;
   const files: string[] = [];
@@ -288,7 +290,9 @@ function parseN(args: string[]): { n: number; files: string[]; err?: string } {
       if (v === undefined || !/^\d+$/.test(v)) return { n, files, err: `invalid number of lines: '${v ?? ""}'` };
       n = parseInt(v, 10);
     } else if (a.startsWith("-n") && /^-n\d+$/.test(a)) {
-      n = parseInt(a.slice(2), 10);
+      n = parseInt(a.slice(2), 10); // attached: -n10
+    } else if (/^-\d+$/.test(a)) {
+      n = parseInt(a.slice(1), 10); // historic shorthand: head -20 ≡ -n 20
     } else if (a === "--") {
       for (let j = i + 1; j < args.length; j++) files.push(args[j]!);
       break;
@@ -536,25 +540,11 @@ export const base64Cmd: CommandImpl = async (ctx) => {
 // cut -d DELIM -f LIST  |  cut -c LIST. LIST = N, "N-", "-M", "N-M" or comma
 // list. Field mode splits on DELIM (default TAB); char mode slices columns.
 export const cut: CommandImpl = async (ctx) => {
-  const args = ctx.argv.slice(1);
-  let delim = "\t";
-  let fieldList: string | null = null;
-  let charList: string | null = null;
-  const files: string[] = [];
-
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]!;
-    if (a === "-d") delim = args[++i] ?? "\t";
-    else if (a.startsWith("-d") && a.length > 2) delim = a.slice(2);
-    else if (a === "-f") fieldList = args[++i] ?? null;
-    else if (a.startsWith("-f") && a.length > 2) fieldList = a.slice(2);
-    else if (a === "-c") charList = args[++i] ?? null;
-    else if (a.startsWith("-c") && a.length > 2) charList = a.slice(2);
-    else if (a === "--") {
-      for (let j = i + 1; j < args.length; j++) files.push(args[j]!);
-      break;
-    } else files.push(a);
-  }
+  const opts = parseOpts(ctx.argv.slice(1), { value: "dfc" });
+  const delim = opts.values.get("d") ?? "\t";
+  const fieldList: string | null = opts.values.get("f") ?? null;
+  const charList: string | null = opts.values.get("c") ?? null;
+  const files = opts.positional;
 
   if (fieldList === null && charList === null) {
     await writeAll(ctx.stderr, "cut: you must specify a list of fields or characters\n");
