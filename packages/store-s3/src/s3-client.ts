@@ -68,6 +68,42 @@ export class S3HttpClient {
   fetch(key: string, init?: RequestInit): Promise<Response> {
     return this.#fetch(this.url(key), init);
   }
+
+  /**
+   * ListObjectsV2 brut sur le bucket. `subPrefix` est concaténé au préfixe du
+   * store (ex. "blobs/"). `continuationToken` pagine au-delà de 1000 clés.
+   */
+  listObjects(subPrefix: string, continuationToken?: string): Promise<Response> {
+    const params = new URLSearchParams({ "list-type": "2", prefix: `${this.prefix}${subPrefix}` });
+    if (continuationToken) params.set("continuation-token", continuationToken);
+    return this.#fetch(`${this.#base}?${params.toString()}`, { method: "GET" });
+  }
+}
+
+/**
+ * Parse les `<Key>` d'une réponse ListObjectsV2 par regex (les réponses S3 sont
+ * du XML bien formé ; on évite une dépendance XML lourde). Renvoie aussi le
+ * `NextContinuationToken` pour la pagination. Acceptable pour du S3 conforme —
+ * documenté comme tel. Les entités XML usuelles (&amp; &lt; &gt;) sont décodées.
+ */
+export function parseListObjectsV2(xml: string): { keys: string[]; nextToken: string | null } {
+  const keys: string[] = [];
+  const keyRe = /<Key>([\s\S]*?)<\/Key>/g;
+  let m: RegExpExecArray | null;
+  while ((m = keyRe.exec(xml)) !== null) keys.push(decodeXmlEntities(m[1]!));
+  const truncated = /<IsTruncated>\s*true\s*<\/IsTruncated>/i.test(xml);
+  const tokenMatch = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml);
+  const nextToken = truncated && tokenMatch ? decodeXmlEntities(tokenMatch[1]!) : null;
+  return { keys, nextToken };
+}
+
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 /** Lit un extrait du corps (pour les messages d'erreur), tolérant aux échecs. */

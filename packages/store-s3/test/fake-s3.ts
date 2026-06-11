@@ -19,6 +19,8 @@ export interface FakeS3Options {
   noConditional?: boolean;
   /** N'émet jamais d'ETag (simule un backend cassé pour le CAS). */
   noEtag?: boolean;
+  /** Taille de page ListObjectsV2 (défaut 1000). Petit → exerce la pagination. */
+  listPageSize?: number;
 }
 
 interface StoredObject {
@@ -30,6 +32,7 @@ export class FakeS3 {
   readonly objects = new Map<string, StoredObject>();
   #counter = 0;
   putCount = 0;
+  deleteCount = 0;
 
   constructor(private readonly opts: FakeS3Options = {}) {}
 
@@ -43,10 +46,56 @@ export class FakeS3 {
     return new URL(url).pathname.replace(/^\/+/, "");
   }
 
+  /** Réponse XML ListObjectsV2 : tri lexicographique + pagination par token. */
+  #listObjectsV2(params: URLSearchParams): Response {
+    // Le prefix S3 inclut le path du bucket : nos clés stockées commencent par
+    // "<bucket>/...". On reconstruit donc le prefix complet attendu.
+    const prefix = params.get("prefix") ?? "";
+    const pageSize = this.opts.listPageSize ?? 1000;
+    const token = params.get("continuation-token");
+
+    // Les clés stockées sont "<bucket>/<prefix-complet>" ; le prefix de la
+    // requête est relatif au bucket. On matche sur le suffixe après "<bucket>/".
+    const matched = [...this.objects.keys()]
+      .map((full) => ({ full, rel: full.replace(/^[^/]+\//, "") }))
+      .filter(({ rel }) => rel.startsWith(prefix))
+      .map(({ rel }) => rel)
+      .sort();
+
+    const start = token ? matched.findIndex((k) => k > token) : 0;
+    const from = start < 0 ? matched.length : start;
+    const page = matched.slice(from, from + pageSize);
+    const truncated = from + pageSize < matched.length;
+    const nextToken = truncated ? page[page.length - 1] : undefined;
+
+    const keysXml = page.map((k) => `<Contents><Key>${escapeXml(k)}</Key></Contents>`).join("");
+    const xml =
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+      `<ListBucketResult>` +
+      `<IsTruncated>${truncated}</IsTruncated>` +
+      keysXml +
+      (nextToken ? `<NextContinuationToken>${escapeXml(nextToken)}</NextContinuationToken>` : "") +
+      `</ListBucketResult>`;
+    return new Response(xml, { status: 200, headers: { "content-type": "application/xml" } });
+  }
+
   readonly fetch = async (url: string, init: RequestInit = {}): Promise<Response> => {
     const method = (init.method ?? "GET").toUpperCase();
+    const parsed = new URL(url);
     const key = this.#keyOf(url);
     const headers = new Headers(init.headers);
+
+    // ListObjectsV2 : GET sur la racine du bucket avec ?list-type=2&prefix=...
+    if (method === "GET" && parsed.searchParams.get("list-type") === "2") {
+      return this.#listObjectsV2(parsed.searchParams);
+    }
+
+    if (method === "DELETE") {
+      const existed = this.objects.delete(key);
+      this.deleteCount += 1;
+      // S3 renvoie 204 No Content que l'objet ait existé ou non.
+      return new Response(null, { status: existed ? 204 : 204 });
+    }
 
     if (method === "GET") {
       const existing = this.objects.get(key);
@@ -98,6 +147,15 @@ export class FakeS3 {
 
     return new Response("MethodNotAllowed", { status: 405 });
   };
+}
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 async function readBody(body: RequestInit["body"]): Promise<Uint8Array> {

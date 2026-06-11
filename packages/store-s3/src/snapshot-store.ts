@@ -1,11 +1,17 @@
-import type { SnapshotManifest, SnapshotStore } from "@ork/kernel";
-import { assertSafeKey, S3HttpClient, throwOnUnexpected, type S3StoreConfig } from "./s3-client.js";
+import type { ListableSnapshotStore, SnapshotManifest } from "@ork/kernel";
+import {
+  assertSafeKey,
+  parseListObjectsV2,
+  S3HttpClient,
+  throwOnUnexpected,
+  type S3StoreConfig,
+} from "./s3-client.js";
 
 /**
  * SnapshotStore sur API objet S3-compatible (AWS S3 / Cloudflare R2 / MinIO).
  * Layout : `${prefix}blobs/${hash}` (binaire immuable) et `${prefix}trees/${id}.json`.
  */
-export class S3SnapshotStore implements SnapshotStore {
+export class S3SnapshotStore implements ListableSnapshotStore {
   readonly #client: S3HttpClient;
 
   constructor(config: S3StoreConfig) {
@@ -66,5 +72,42 @@ export class S3SnapshotStore implements SnapshotStore {
     if (res.status === 404) return null;
     if (!res.ok) await throwOnUnexpected(res, `getTree ${id}`);
     return JSON.parse(await res.text()) as SnapshotManifest;
+  }
+
+  /** Itère les clés sous `${prefix}${subPrefix}` via ListObjectsV2 paginé. */
+  async *#listKeys(subPrefix: string): AsyncIterable<string> {
+    const fullPrefix = `${this.#client.prefix}${subPrefix}`;
+    let token: string | undefined;
+    do {
+      const res = await this.#client.listObjects(subPrefix, token);
+      if (!res.ok) await throwOnUnexpected(res, `list ${subPrefix}`);
+      const { keys, nextToken } = parseListObjectsV2(await res.text());
+      for (const key of keys) {
+        // Les clés sont absolues (préfixe inclus) : on retire `${prefix}${subPrefix}`.
+        if (key.startsWith(fullPrefix)) yield key.slice(fullPrefix.length);
+      }
+      token = nextToken ?? undefined;
+    } while (token);
+  }
+
+  async *listTrees(): AsyncIterable<string> {
+    for await (const name of this.#listKeys("trees/")) {
+      if (name.endsWith(".json")) yield name.slice(0, -".json".length);
+    }
+  }
+
+  async *listBlobs(): AsyncIterable<string> {
+    yield* this.#listKeys("blobs/");
+  }
+
+  async deleteTree(id: string): Promise<void> {
+    const res = await this.#client.fetch(this.#treeKey(id), { method: "DELETE" });
+    // 404 toléré (déjà supprimé). S3 répond souvent 204 même si absent.
+    if (res.status !== 404 && !res.ok) await throwOnUnexpected(res, `deleteTree ${id}`);
+  }
+
+  async deleteBlob(hash: string): Promise<void> {
+    const res = await this.#client.fetch(this.#blobKey(hash), { method: "DELETE" });
+    if (res.status !== 404 && !res.ok) await throwOnUnexpected(res, `deleteBlob ${hash}`);
   }
 }

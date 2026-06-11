@@ -17,9 +17,17 @@ export { traceMiddleware } from "./middleware/trace.js";
 export { ProcTable, type ProcHandle, type ProcIo, type ProcMain, type ProcInfo, type ProcStatus } from "./proc.js";
 export { readAll, readText, writeAll } from "./streams.js";
 export { sha256Hex } from "./snapshot/hash.js";
-export { MemorySnapshotStore, type SnapshotStore, type SnapshotManifest, type ManifestEntry } from "./snapshot/store.js";
+export {
+  MemorySnapshotStore,
+  isListable,
+  type SnapshotStore,
+  type ListableSnapshotStore,
+  type SnapshotManifest,
+  type ManifestEntry,
+} from "./snapshot/store.js";
 export { DiskSnapshotStore } from "./snapshot/disk-store.js";
 export { snapshotVfs, restoreVfs } from "./snapshot/snapshot.js";
+export { gcSnapshots, type GcOptions, type GcResult } from "./snapshot/gc.js";
 export { createKernel, restoreKernel, type Kernel, type KernelOptions } from "./kernel.js";
 export {
   MemoryPointerStore,
