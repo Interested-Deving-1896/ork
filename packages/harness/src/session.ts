@@ -1,11 +1,13 @@
 import {
   createKernel,
   restoreKernel,
+  KernelError,
   type Kernel,
   type KernelOptions,
   type SnapshotStore,
   type PermissionsConfig,
   type Limits,
+  type Workspace,
 } from "@ork/kernel";
 import { Shell } from "@ork/shell";
 import { createTools } from "@ork/tools";
@@ -43,6 +45,18 @@ export interface SessionConfig {
   tokenBudget?: number;
   /** Override the fetch implementation (forwarded to the kernel for `curl`). */
   fetchImpl?: typeof fetch;
+  /**
+   * Workspace externe (FS partagé, géré par Workspace.open/commit). Mutuellement
+   * exclusif avec `files`. La config kernel (mounts/network/limits/fetchImpl)
+   * de cette SessionConfig est ignorée : elle a été fixée à Workspace.open.
+   */
+  workspace?: Workspace;
+  /**
+   * Historique initial de la conversation (thread géré par l'hôte). La session
+   * démarre avec ces messages et les fait croître ; à l'hôte de re-sauvegarder
+   * `session.messages` après le tour.
+   */
+  messages?: ModelMessage[];
 }
 
 export interface Session {
@@ -188,8 +202,11 @@ function kernelOptions(cfg: SessionConfig): KernelOptions {
 
 /** Build a kernel + shell + tools synchronously and return a multi-turn Session. */
 export function createSession(cfg: SessionConfig): Session {
-  const kernel = createKernel(kernelOptions(cfg));
-  return buildSession(kernel, cfg);
+  if (cfg.workspace && cfg.files) {
+    throw new KernelError("EINVAL", "createSession: `workspace` and `files` are mutually exclusive");
+  }
+  const kernel = cfg.workspace ? cfg.workspace.kernel : createKernel(kernelOptions(cfg));
+  return buildSession(kernel, { ...cfg, initialMessages: cfg.messages });
 }
 
 export interface RestoreSessionArgs extends Omit<SessionConfig, "files"> {
