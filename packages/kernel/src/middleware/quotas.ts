@@ -7,6 +7,8 @@ export interface Limits {
   maxFileSize: number;
   maxSyscallsPerTurn: number;
   maxProcs: number;
+  /** Plafond de la taille du corps des réponses HTTP (octets). */
+  maxResponseSize: number;
 }
 
 export const DEFAULT_LIMITS: Limits = {
@@ -14,6 +16,7 @@ export const DEFAULT_LIMITS: Limits = {
   maxFileSize: 8 * 1024 * 1024,
   maxSyscallsPerTurn: 10_000,
   maxProcs: 64,
+  maxResponseSize: 8 * 1024 * 1024,
 };
 
 export class QuotaTracker {
