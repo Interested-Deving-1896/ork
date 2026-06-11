@@ -69,16 +69,39 @@ function stepToParts(step: ScriptStep, idx: number): LanguageModelV2StreamPart[]
  * Build a MockLanguageModelV2 that emits `script` steps in order, one per
  * `doStream` call. Uses a function-based doStream popping from a queue (the
  * array form of the mock skips index 0, so a queue is more reliable).
+ *
+ * `delayMs` (optional) holds each `doStream` open that long before resolving —
+ * useful to keep a turn in flight while an AbortController fires mid-stream.
  */
-export function scriptedModel(script: ScriptStep[]): MockLanguageModelV2 {
+export function scriptedModel(script: ScriptStep[], delayMs = 0): MockLanguageModelV2 {
   let call = 0;
   return new MockLanguageModelV2({
-    doStream: async () => {
+    doStream: async ({ abortSignal }) => {
+      if (delayMs > 0) await sleep(delayMs, abortSignal);
       const step = script[call] ?? { kind: "text", text: "" };
       const parts = stepToParts(step as ScriptStep, call);
       call += 1;
       return { stream: streamFromParts(parts) };
     },
+  });
+}
+
+/** Resolve after `ms`, or reject early if `signal` aborts (mimics a real provider). */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
   });
 }
 

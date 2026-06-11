@@ -62,9 +62,21 @@ export interface SessionConfig {
   messages?: ModelMessage[];
 }
 
+/** Options for a single {@link Session.send} turn. */
+export interface SendOptions {
+  /**
+   * Abort the turn (e.g. the HTTP client disconnected mid-SSE). The signal is
+   * forwarded to the AI SDK's `streamText({ abortSignal })`, which stops the
+   * model call and tool loop — no further model spend. The turn then emits a
+   * final `{ type: "error", message: "aborted" }` event and the iterator
+   * completes cleanly (never throws).
+   */
+  signal?: AbortSignal;
+}
+
 export interface Session {
   /** Run one turn; yields a stream of {@link SessionEvent}. */
-  send(prompt: string): AsyncIterable<SessionEvent>;
+  send(prompt: string, opts?: SendOptions): AsyncIterable<SessionEvent>;
   /** Snapshot the FS + conversation into a store. */
   snapshot(store: SnapshotStore, opts?: { meta?: unknown }): Promise<{ snapshotId: string }>;
   /** Read a file's raw bytes from the virtual FS. */
@@ -90,10 +102,18 @@ function buildSession(
   const maxSteps = cfg.maxSteps ?? DEFAULT_MAX_STEPS;
   const messages: ModelMessage[] = cfg.initialMessages ? [...cfg.initialMessages] : [];
 
-  async function* send(prompt: string): AsyncIterable<SessionEvent> {
+  async function* send(prompt: string, opts?: SendOptions): AsyncIterable<SessionEvent> {
+    const signal = opts?.signal;
     // New turn: reset per-turn quota counters and add the user message.
     kernel.resetTurn();
     messages.push({ role: "user", content: prompt });
+
+    // Fast path: already aborted before any model call. Emit the terminal
+    // aborted event without spending. Only the user message stays appended.
+    if (signal?.aborted) {
+      yield { type: "error", message: "aborted" };
+      return;
+    }
 
     // Optional compaction before the call (no-op when tokenBudget unset).
     // compact() always returns a fresh array, so splicing it back into the live
@@ -104,6 +124,7 @@ function buildSession(
     }
 
     let accumulatedText = "";
+    let aborted = false;
     try {
       const result = streamText({
         model: cfg.model,
@@ -111,10 +132,21 @@ function buildSession(
         messages,
         tools,
         stopWhen: stepCountIs(maxSteps),
+        // Forward the caller's signal so the AI SDK stops the model call + tool
+        // loop on abort (no wasted model spend). The `abort` stream part below
+        // is emitted by the SDK when this fires mid-stream.
+        abortSignal: signal,
       });
 
       for await (const part of result.fullStream) {
         switch (part.type) {
+          case "abort": {
+            // The AI SDK aborted the call (signal fired mid-stream). Surface a
+            // terminal aborted event and stop consuming the stream.
+            aborted = true;
+            yield { type: "error", message: "aborted" };
+            break;
+          }
           case "text-delta": {
             accumulatedText += part.text;
             yield { type: "text_delta", text: part.text };
@@ -163,15 +195,23 @@ function buildSession(
           }
           default:
             // text-start/end, reasoning, tool-input-*, start, start-step, file,
-            // source, abort, raw — not part of the public contract.
+            // source, raw — not part of the public contract.
             break;
         }
+        if (aborted) break;
       }
 
-      // Persist the assistant + tool messages generated this turn so the next
-      // turn has the full context. The tools already mutated the kernel FS.
-      const response = await result.response;
-      messages.push(...response.messages);
+      // Persist whatever assistant + tool messages the turn produced so the
+      // next turn has the full context. On abort, result.response resolves to
+      // the partial messages (possibly none) — append them best-effort; if it
+      // rejects (some providers throw the abort), just keep the user message.
+      try {
+        const response = await result.response;
+        messages.push(...response.messages);
+      } catch (err) {
+        if (!aborted) throw err;
+        // Aborted before any persistable response: only the user message stays.
+      }
     } catch (err) {
       // Never throw out of the async iterator: surface as an error event.
       yield { type: "error", message: errText(err) };
