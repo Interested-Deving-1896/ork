@@ -184,6 +184,45 @@ describe("error handling", () => {
   });
 });
 
+describe("abort-on-disconnect", () => {
+  it("an already-aborted signal completes the iterator with an aborted error event (no throw)", async () => {
+    const model = scriptedModel([{ kind: "text", text: "should not be seen", finishReason: "stop" }]);
+    const session = createSession({ model });
+    const ac = new AbortController();
+    ac.abort();
+    const events = await collect(session.send("go", { signal: ac.signal })); // must not throw
+    const err = events.find((e) => e.type === "error");
+    expect(err).toBeDefined();
+    expect(err && err.type === "error" && err.message).toBe("aborted");
+    // No turn_done on an aborted turn.
+    expect(events.some((e) => e.type === "turn_done")).toBe(false);
+    // The user prompt is still recorded.
+    expect(session.messages[0] && session.messages[0].content).toBe("go");
+  });
+
+  it("aborting mid-stream completes cleanly with an aborted error event", async () => {
+    // delayMs holds the model's doStream open; we abort while it's in flight.
+    const model = scriptedModel([{ kind: "text", text: "late", finishReason: "stop" }], 50);
+    const session = createSession({ model });
+    const ac = new AbortController();
+    const iter = session.send("go", { signal: ac.signal });
+    setTimeout(() => ac.abort(), 5);
+    const events = await collect(iter); // must not throw
+    const err = events.find((e) => e.type === "error");
+    expect(err).toBeDefined();
+    expect(err && err.type === "error" && err.message).toBe("aborted");
+    expect(events.some((e) => e.type === "turn_done")).toBe(false);
+  });
+
+  it("without a signal, behaviour is unchanged (backward compatible)", async () => {
+    const model = scriptedModel([{ kind: "text", text: "hi", finishReason: "stop" }]);
+    const session = createSession({ model });
+    const events = await collect(session.send("go"));
+    expect(events.some((e) => e.type === "turn_done")).toBe(true);
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+});
+
 describe("files & seeding", () => {
   it("seeds initial files and listFiles returns written paths", async () => {
     const model = scriptedModel([

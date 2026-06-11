@@ -12,20 +12,51 @@
  * Run:  pnpm -F @ork/example server      (or: tsx example/04-server.ts)
  * Then, in another terminal, the curl commands printed below.
  */
-import { createApp, SessionManager, startServer } from "@ork/server";
+import { createApp, SessionManager, SessionError, startServer } from "@ork/server";
 import { MemorySnapshotStore } from "@ork/kernel";
+import { anthropic } from "@ai-sdk/anthropic";
+import type { LanguageModel } from "ai";
 
 const PORT = 3000;
 
+// MODEL ALLOW-LIST (example-level policy). The default resolver is the identity
+// function — it forwards any id straight to the AI Gateway, so a tenant could
+// request any/expensive model. A production host pins an allow-list and rejects
+// the rest. A SessionError(403, ...) thrown here propagates through
+// manager.create()/restore() to the app's onError, which maps it to a 403.
+const ALLOWED = new Set(["anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4-5"]);
+
+// When ANTHROPIC_API_KEY is set we can also serve a direct-Anthropic alias
+// (like example 03): the allowed id "claude-sonnet-4-6" maps to an
+// @ai-sdk/anthropic model instance. Otherwise ids route through the Gateway.
+const HAS_ANTHROPIC = Boolean(process.env.ANTHROPIC_API_KEY);
+
+function allowlistResolver(id: string): LanguageModel {
+  if (HAS_ANTHROPIC && id === "claude-sonnet-4-6") {
+    return anthropic("claude-sonnet-4-6");
+  }
+  if (!ALLOWED.has(id)) {
+    throw new SessionError(403, "model_not_allowed", `model not allowed: ${id}`);
+  }
+  return id; // gateway routing of "provider/model"
+}
+
 function main() {
   // The SessionManager owns sessions + the snapshot store. modelResolver maps
-  // the model id from the HTTP body to a LanguageModel — default identity sends
-  // "provider/model" to the AI Gateway. Swap in DiskSnapshotStore / an R2
-  // adapter for durable, cross-instance sessions.
+  // the model id from the HTTP body to a LanguageModel. Swap in DiskSnapshotStore
+  // / an R2 adapter for durable, cross-instance sessions. evictAfterMs sets the
+  // idle TTL used by sweep()/startSweeper() (default 30m).
   const manager = new SessionManager({
     store: new MemorySnapshotStore(),
-    // modelResolver: (id) => id,   // default; or map ids to pinned providers
+    modelResolver: allowlistResolver,
+    evictAfterMs: 30 * 60 * 1000,
   });
+
+  // OPT-IN idle eviction: reclaim sessions idle > evictAfterMs and not busy.
+  // sweep() snapshots each best-effort first and returns sessionId->snapshotId
+  // so you can persist restore pointers. The timer is unref'd. Nothing here is
+  // automatic in the server itself — the host wires it up:
+  const sweeper = manager.startSweeper(60_000); // sweep every minute
 
   // A trivial tenant auth: API key -> tenant id. Replace with your own.
   const tenants: Record<string, string> = {
@@ -45,7 +76,7 @@ function main() {
   console.log(`# 1. create a session (seeded with a file)`);
   console.log(`curl -s ${base}/v1/sessions -H 'Authorization: Bearer key-alice' \\`);
   console.log(`  -H 'content-type: application/json' \\`);
-  console.log(`  -d '{"model":"anthropic/claude-sonnet-4-5","files":{"/notes.txt":"todo: ship ork"}}'`);
+  console.log(`  -d '{"model":"anthropic/claude-sonnet-4.5","files":{"/notes.txt":"todo: ship ork"}}'`);
   console.log(`# -> {"sessionId":"..."}\n`);
   console.log(`# 2. send a message, stream the agent's work as SSE`);
   console.log(`curl -N ${base}/v1/sessions/<ID>/messages -H 'Authorization: Bearer key-alice' \\`);
@@ -56,11 +87,16 @@ function main() {
   console.log(`# 4. snapshot, then restore into a fresh session`);
   console.log(`curl -s -XPOST ${base}/v1/sessions/<ID>/snapshot -H 'Authorization: Bearer key-alice'`);
   console.log(`curl -s ${base}/v1/sessions -H 'Authorization: Bearer key-alice' \\`);
-  console.log(`  -H 'content-type: application/json' -d '{"model":"anthropic/claude-sonnet-4-5","snapshotId":"<SNAP>"}'\n`);
+  console.log(`  -H 'content-type: application/json' -d '{"model":"anthropic/claude-sonnet-4.5","snapshotId":"<SNAP>"}'\n`);
   console.log("Tenant isolation: key-bob gets 403 on alice's sessions; no key -> 401.");
+  console.log(
+    `Model policy: only ${[...ALLOWED].join(", ")}${HAS_ANTHROPIC ? ' (+ "claude-sonnet-4-6" direct Anthropic)' : ""} are allowed; anything else -> 403 model_not_allowed.`,
+  );
+  console.log("Idle sessions are swept every 60s (snapshotted first, then evicted).");
   console.log("Press Ctrl+C to stop.\n");
 
   process.on("SIGINT", () => {
+    sweeper.stop();
     server.close();
     console.log("\nserver stopped.");
     process.exit(0);
