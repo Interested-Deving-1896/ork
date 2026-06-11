@@ -3,8 +3,17 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256Hex } from "../src/snapshot/hash.js";
-import { MemorySnapshotStore, type SnapshotManifest } from "../src/snapshot/store.js";
+import { MemorySnapshotStore, isListable, type SnapshotManifest } from "../src/snapshot/store.js";
 import { DiskSnapshotStore } from "../src/snapshot/disk-store.js";
+import { snapshotVfs } from "../src/snapshot/snapshot.js";
+import { gcSnapshots } from "../src/snapshot/gc.js";
+import { Vfs } from "../src/vfs.js";
+
+async function collect(it: AsyncIterable<string>): Promise<Set<string>> {
+  const out = new Set<string>();
+  for await (const x of it) out.add(x);
+  return out;
+}
 
 const enc = new TextEncoder();
 
@@ -71,6 +80,85 @@ test("DiskSnapshotStore surfaces corruption instead of returning null", async ()
     await wf(join(dir, "trees", "snap1.json"), "{corrupt");
     await expect(store.getTree("snap1")).rejects.toThrow();
     expect(await store.getTree("missing")).toBeNull(); // ENOENT reste null
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("isListable: Memory + Disk stores are listable", async () => {
+  expect(isListable(new MemorySnapshotStore())).toBe(true);
+  const dir = await mkdtemp(join(tmpdir(), "ork-store-"));
+  try {
+    expect(isListable(new DiskSnapshotStore(dir))).toBe(true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  // Un store sans les méthodes de listing n'est pas listable.
+  const bare = { putBlob() {}, getBlob() {}, hasBlob() {}, putTree() {}, getTree() {} };
+  expect(isListable(bare as never)).toBe(false);
+});
+
+test("DiskSnapshotStore listing on empty store yields nothing (no dirs yet)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ork-store-"));
+  try {
+    const store = new DiskSnapshotStore(dir);
+    expect(await collect(store.listTrees())).toEqual(new Set());
+    expect(await collect(store.listBlobs())).toEqual(new Set());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DiskSnapshotStore listTrees/listBlobs + delete (ENOENT tolerated)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ork-store-"));
+  try {
+    const store = new DiskSnapshotStore(dir);
+    await store.putBlob("h1", enc.encode("a"));
+    await store.putBlob("h2", enc.encode("b"));
+    await store.putTree("t1", { version: 1, entries: {} });
+    await store.putTree("t2", { version: 1, entries: {} });
+
+    expect(await collect(store.listTrees())).toEqual(new Set(["t1", "t2"]));
+    expect(await collect(store.listBlobs())).toEqual(new Set(["h1", "h2"]));
+
+    await store.deleteTree("t1");
+    await store.deleteBlob("h2");
+    await store.deleteTree("t1"); // re-delete → no-op
+    await store.deleteBlob("nope"); // absent → no-op
+
+    expect(await collect(store.listTrees())).toEqual(new Set(["t2"]));
+    expect(await collect(store.listBlobs())).toEqual(new Set(["h1"]));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gcSnapshots end-to-end over DiskSnapshotStore", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ork-store-"));
+  try {
+    const store = new DiskSnapshotStore(dir);
+
+    // Arbre vivant : keep.txt (blob partagé) + live.txt.
+    const live = new Vfs({ now: () => 1 });
+    live.writeFile("/keep.txt", enc.encode("keep"));
+    live.writeFile("/live.txt", enc.encode("live"));
+    const { snapshotId: liveId } = await snapshotVfs(live, store);
+
+    // Arbre mort : keep.txt (même blob) + dead.txt (blob unique).
+    const dead = new Vfs({ now: () => 1 });
+    dead.writeFile("/keep.txt", enc.encode("keep"));
+    dead.writeFile("/dead.txt", enc.encode("dead"));
+    await snapshotVfs(dead, store);
+
+    const res = await gcSnapshots(store, { roots: [liveId] });
+    expect(res.keptTrees).toBe(1);
+    expect(res.deletedTrees).toBe(1);
+
+    expect(await collect(store.listTrees())).toEqual(new Set([liveId]));
+    const blobs = await collect(store.listBlobs());
+    expect(blobs.has(await sha256Hex(enc.encode("keep")))).toBe(true);
+    expect(blobs.has(await sha256Hex(enc.encode("live")))).toBe(true);
+    expect(blobs.has(await sha256Hex(enc.encode("dead")))).toBe(false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

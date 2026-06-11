@@ -17,6 +17,10 @@ ork is a sandboxed agent runtime: it runs LLM coding agents against a fully in-p
 
 The kernel ships in-memory and on-disk stores for snapshots and workspace pointers; both are single-process. For a real SaaS deployment, `@ork/store-s3` provides `S3SnapshotStore` and `S3PointerStore` over the plain S3-compatible HTTP API (works with AWS S3, Cloudflare R2, and MinIO) using `aws4fetch` for SigV4 signing — no heavy SDK. Snapshots are content-addressed blobs/trees; the pointer store implements the optimistic-concurrency CAS contract via conditional writes (`If-None-Match: *` to create, `If-Match: <etag>` to advance), so multiple instances can commit the same workspace without clobbering each other. **Multi-instance pointer safety requires a backend that supports conditional PUT** (R2 and recent AWS S3 do); a backend that answers `501 NotImplemented` is rejected with a clear error rather than silently corrupting pointers.
 
+## Snapshot GC
+
+Snapshots accumulate over time — losing CAS commits, superseded workspace states, deleted sessions — so `gcSnapshots(store, { roots })` reclaims them by **mark-and-sweep from live roots**. Reachability is by *pointer*: the host passes the snapshot ids still referenced (read each known workspace pointer, plus any session-held snapshots) as `roots`; the GC marks every blob referenced by a kept tree, then sweeps any tree or blob that isn't reachable. Orphans' `meta.workspace.parent` chains are explicitly **not** treated as roots (an optional `keepLineageDepth` keeps N ancestors per root for history). The store must implement the listing extension (`ListableSnapshotStore` — Memory, Disk, and S3 all do). Safety rails: GC refuses to run with empty roots on a non-empty store unless `force: true`, and `dryRun: true` reports counts without deleting. **Run GC in a maintenance window** (or while holding the hosts' user locks) — a commit racing the sweep can write a tree after listing, whose shared blobs could then be swept.
+
 ## Run the tests
 
 ```sh

@@ -1,7 +1,7 @@
-import { mkdir, readFile, writeFile, access } from "node:fs/promises";
+import { mkdir, readFile, writeFile, access, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { KernelError } from "../errors.js";
-import type { SnapshotManifest, SnapshotStore } from "./store.js";
+import type { ListableSnapshotStore, SnapshotManifest } from "./store.js";
 
 const SAFE_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -14,7 +14,7 @@ function isEnoent(err: unknown): boolean {
 }
 
 /** Store sur disque local : blobs/<hash>, trees/<id>.json. Pour dev et tests. */
-export class DiskSnapshotStore implements SnapshotStore {
+export class DiskSnapshotStore implements ListableSnapshotStore {
   constructor(private rootDir: string) {}
 
   #blobPath(hash: string): string {
@@ -66,6 +66,46 @@ export class DiskSnapshotStore implements SnapshotStore {
     } catch (err) {
       if (isEnoent(err)) return null;
       throw err;
+    }
+  }
+
+  async *listTrees(): AsyncIterable<string> {
+    let names: string[];
+    try {
+      names = await readdir(join(this.rootDir, "trees"));
+    } catch (err) {
+      if (isEnoent(err)) return; // dossier jamais créé → store vide
+      throw err;
+    }
+    for (const name of names) {
+      if (name.endsWith(".json")) yield name.slice(0, -".json".length);
+    }
+  }
+
+  async *listBlobs(): AsyncIterable<string> {
+    let names: string[];
+    try {
+      names = await readdir(join(this.rootDir, "blobs"));
+    } catch (err) {
+      if (isEnoent(err)) return;
+      throw err;
+    }
+    for (const name of names) yield name;
+  }
+
+  async deleteTree(id: string): Promise<void> {
+    try {
+      await unlink(this.#treePath(id));
+    } catch (err) {
+      if (!isEnoent(err)) throw err; // déjà supprimé → no-op
+    }
+  }
+
+  async deleteBlob(hash: string): Promise<void> {
+    try {
+      await unlink(this.#blobPath(hash));
+    } catch (err) {
+      if (!isEnoent(err)) throw err;
     }
   }
 }
