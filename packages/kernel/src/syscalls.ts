@@ -1,5 +1,6 @@
 import type { Stat, Vfs } from "./vfs.js";
 import { normalizePath } from "./path.js";
+import { KernelError } from "./errors.js";
 
 export type SyscallName =
   | "readFile"
@@ -44,10 +45,66 @@ export function createSyscalls(opts: {
   vfs: Vfs;
   middlewares: Middleware[];
   fetchImpl?: typeof fetch;
+  /** Plafond de la taille du corps des réponses HTTP (octets). Absent = pas de plafond. */
+  maxResponseSize?: number;
 }): FsSyscalls {
-  const { vfs, middlewares } = opts;
+  const { vfs, middlewares, maxResponseSize } = opts;
   const fetchImpl = opts.fetchImpl ?? fetch;
   const enc = new TextEncoder();
+
+  /**
+   * Applique le plafond `maxResponseSize` à une réponse.
+   * - Content-Length annoncé > limite → EQUOTA sans lire le corps.
+   * - Sinon, lecture en streaming en comptant les octets : on annule et on lève EQUOTA
+   *   dès que la limite est franchie, sans bufferiser tout le corps.
+   * Renvoie une nouvelle Response reconstruite depuis les octets bufferisés, pour que
+   *   les consommateurs en aval (.text()/.json()/.arrayBuffer()) continuent de fonctionner.
+   */
+  async function capResponse(res: Response, limit: number): Promise<Response> {
+    const declared = res.headers.get("content-length");
+    if (declared !== null) {
+      const n = Number(declared);
+      if (Number.isFinite(n) && n > limit) {
+        // On annule le corps sans le lire pour libérer la connexion.
+        await res.body?.cancel().catch(() => {});
+        throw new KernelError("EQUOTA", `maxResponseSize (${limit}) exceeded: Content-Length ${n}`);
+      }
+    }
+
+    if (res.body === null) return res;
+
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value === undefined) continue;
+        total += value.byteLength;
+        if (total > limit) {
+          await reader.cancel().catch(() => {});
+          throw new KernelError("EQUOTA", `maxResponseSize (${limit}) exceeded`);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      buf.set(c, off);
+      off += c.byteLength;
+    }
+    // Réponse reconstruite : on préserve statut, statusText et en-têtes.
+    return new Response(buf, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    });
+  }
 
   function run<T>(call: SyscallDescriptor, impl: () => Promise<T>): Promise<T> {
     Object.freeze(call);
@@ -92,7 +149,10 @@ export function createSyscalls(opts: {
     fetch: (url, init) =>
       run(
         { name: "fetch", url, method: (init?.method ?? "GET").toUpperCase(), write: false },
-        () => fetchImpl(url, init),
+        async () => {
+          const res = await fetchImpl(url, init);
+          return maxResponseSize === undefined ? res : capResponse(res, maxResponseSize);
+        },
       ),
   };
 }

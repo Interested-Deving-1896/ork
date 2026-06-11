@@ -38,6 +38,7 @@ function buildKernel(vfs: Vfs, opts: KernelOptions): Kernel {
   const sys = createSyscalls({
     vfs,
     fetchImpl: opts.fetchImpl,
+    maxResponseSize: limits.maxResponseSize,
     middlewares: [
       traceMiddleware(bus), // outermost : trace aussi les refus
       permissionsMiddleware({ mounts: opts.mounts, network: opts.network }),
