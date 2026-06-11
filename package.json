@@ -4,7 +4,8 @@
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "scripts": {
-    "test": "pnpm -r test",
+    "build": "pnpm -r --filter './packages/*' build",
+    "test": "pnpm build && pnpm -r test",
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {

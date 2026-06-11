@@ -35,7 +35,7 @@ export class S3SnapshotStore implements ListableSnapshotStore {
     // PUT simple (idempotent : ré-écrire le même contenu est sans effet).
     const res = await this.#client.fetch(key, {
       method: "PUT",
-      body: data,
+      body: toArrayBuffer(data),
     });
     if (!res.ok) await throwOnUnexpected(res, `putBlob ${hash}`);
   }
@@ -110,4 +110,10 @@ export class S3SnapshotStore implements ListableSnapshotStore {
     const res = await this.#client.fetch(this.#blobKey(hash), { method: "DELETE" });
     if (res.status !== 404 && !res.ok) await throwOnUnexpected(res, `deleteBlob ${hash}`);
   }
+}
+
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+  const bytes = new Uint8Array(data.byteLength);
+  bytes.set(data);
+  return bytes.buffer;
 }
