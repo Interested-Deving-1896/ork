@@ -11,6 +11,11 @@ ork is a sandboxed agent runtime: it runs LLM coding agents against a fully in-p
 | `@ork/tools` | The agent tools — Bash, Read, Write, Edit, Glob, Grep — wired to the kernel/shell. |
 | `@ork/harness` | Agent session loop: AI SDK tool loop, system prompt, compaction, and the public `SessionEvent` stream. |
 | `@ork/server` | Hono HTTP API + SSE, `SessionManager` (tenant isolation, turn lock, snapshot ownership). |
+| `@ork/store-s3` | Cloud storage adapters (`S3SnapshotStore`, `S3PointerStore`) over the S3-compatible HTTP API. |
+
+## Storage
+
+The kernel ships in-memory and on-disk stores for snapshots and workspace pointers; both are single-process. For a real SaaS deployment, `@ork/store-s3` provides `S3SnapshotStore` and `S3PointerStore` over the plain S3-compatible HTTP API (works with AWS S3, Cloudflare R2, and MinIO) using `aws4fetch` for SigV4 signing — no heavy SDK. Snapshots are content-addressed blobs/trees; the pointer store implements the optimistic-concurrency CAS contract via conditional writes (`If-None-Match: *` to create, `If-Match: <etag>` to advance), so multiple instances can commit the same workspace without clobbering each other. **Multi-instance pointer safety requires a backend that supports conditional PUT** (R2 and recent AWS S3 do); a backend that answers `501 NotImplemented` is rejected with a clear error rather than silently corrupting pointers.
 
 ## Run the tests
 
