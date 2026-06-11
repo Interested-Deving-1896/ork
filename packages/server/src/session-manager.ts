@@ -29,6 +29,13 @@ export interface SessionManagerOptions {
   /** Resolves a model id string to a LanguageModel. Defaults to identity. */
   modelResolver?: ModelResolver;
   /**
+   * Idle TTL for {@link SessionManager.sweep}: a session is eligible for
+   * eviction once `now - lastUsed > evictAfterMs` AND it is not busy. Defaults
+   * to 30 minutes. Eviction is never automatic — call sweep() yourself or opt
+   * in via {@link SessionManager.startSweeper}.
+   */
+  evictAfterMs?: number;
+  /**
    * SECURITY DEFAULT (false): restore is only permitted for a snapshotId whose
    * owning tenant this manager has recorded. The content-addressed store is
    * keyed by hash only — an unguessable hash is NOT an authorization boundary —
@@ -91,11 +98,13 @@ export class SessionManager {
   private readonly store: SnapshotStore;
   private readonly resolveModel: ModelResolver;
   private readonly allowUnownedRestore: boolean;
+  private readonly evictAfterMs: number;
 
   constructor(opts: SessionManagerOptions = {}) {
     this.store = opts.store ?? new MemorySnapshotStore();
     this.resolveModel = opts.modelResolver ?? identityResolver;
     this.allowUnownedRestore = opts.allowUnownedRestore ?? false;
+    this.evictAfterMs = opts.evictAfterMs ?? 30 * 60 * 1000;
   }
 
   /** Create a fresh session and return its id. */
@@ -199,6 +208,57 @@ export class SessionManager {
     }
     this.sessions.delete(sessionId);
     return { snapshotId };
+  }
+
+  /**
+   * Evict every session idle longer than `evictAfterMs` and not currently busy
+   * (a turn in flight is never evicted — it holds shared mutable state). Each
+   * evicted session is snapshotted best-effort first, its owner recorded in
+   * #snapshotOwners so the tenant can later restore it, and then removed.
+   *
+   * Returns the evicted session ids plus a sessionId -> snapshotId map so the
+   * host can persist restore pointers. A session whose final snapshot failed
+   * is still evicted, but absent from `snapshots`.
+   */
+  async sweep(): Promise<{ evicted: string[]; snapshots: Record<string, string> }> {
+    const now = nowMs();
+    const evicted: string[] = [];
+    const snapshots: Record<string, string> = {};
+    for (const [id, entry] of this.sessions) {
+      if (entry.busy) continue;
+      if (now - entry.lastUsed <= this.evictAfterMs) continue;
+      try {
+        const { snapshotId } = await entry.session.snapshot(this.store);
+        entry.snapshotId = snapshotId;
+        this.#snapshotOwners.set(snapshotId, entry.tenant);
+        snapshots[id] = snapshotId;
+      } catch {
+        // Best-effort: a snapshot failure must not block eviction.
+      }
+      this.sessions.delete(id);
+      evicted.push(id);
+    }
+    return { evicted, snapshots };
+  }
+
+  /**
+   * Run {@link SessionManager.sweep} on an interval. Returns a handle whose
+   * stop() clears the timer. The timer is unref'd so it never keeps the Node
+   * process alive on its own. Hosts opt in explicitly — nothing is automatic.
+   */
+  startSweeper(intervalMs: number): { stop: () => void } {
+    const timer = setInterval(() => {
+      void this.sweep();
+    }, intervalMs);
+    // Don't hold the event loop open just for the sweeper.
+    (timer as { unref?: () => void }).unref?.();
+    return { stop: () => clearInterval(timer) };
+  }
+
+  /** TEST SEAM: backdate a session's lastUsed so sweep() treats it as idle. */
+  _setLastUsedForTest(sessionId: string, lastUsed: number): void {
+    const entry = this.sessions.get(sessionId);
+    if (entry) entry.lastUsed = lastUsed;
   }
 
   private store_(session: Session, tenant: string, snapshotId?: string): string {

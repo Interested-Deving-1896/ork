@@ -140,9 +140,14 @@ export function createApp(opts: CreateAppOptions): Hono {
       throw jsonError("turn_in_flight", "a turn is already running for this session", 409);
     }
 
+    // If the client disconnects mid-SSE, this signal fires; we forward it to
+    // the harness so the model call + tool loop stop (no wasted spend). The
+    // turn lock is still released in finally below.
+    const signal = c.req.raw.signal;
+
     return streamSSE(c, async (stream) => {
       try {
-        for await (const event of entry.session.send(prompt)) {
+        for await (const event of entry.session.send(prompt, { signal })) {
           await stream.writeSSE({ data: JSON.stringify(event), event: event.type });
         }
       } catch (err) {

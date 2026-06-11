@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { LanguageModel } from "ai";
+import { MemorySnapshotStore } from "@ork/kernel";
 import { createApp } from "../src/app.js";
 import { SessionManager, SessionError, type ModelResolver } from "../src/session-manager.js";
 import { scriptedModel, errorPartModel, type ScriptStep } from "./mock-model.js";
@@ -422,6 +423,150 @@ describe("DELETE /v1/sessions/:id", () => {
 
     const after = await a.request(`/v1/sessions/${sessionId}/fs`);
     expect(after.status).toBe(404);
+  });
+});
+
+describe("abort-on-disconnect (Fix: turn abort)", () => {
+  it("aborting the request mid-turn releases the lock so a later turn succeeds", async () => {
+    // A slow model keeps the turn in flight; we abort the request mid-stream.
+    const a = app({ resolver: resolverFor(scriptedModel([{ kind: "text", text: "late" }], 100)) });
+    const { sessionId } = await createSession(a, { model: "mock/x" });
+
+    const ac = new AbortController();
+    const p = a.request(`/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "go" }),
+      signal: ac.signal,
+    });
+    // Abort shortly after the request opens (turn is in flight).
+    setTimeout(() => ac.abort(), 10);
+    try {
+      const res = await p;
+      // If the response resolved, drain it (it may carry an aborted error event).
+      await res.text().catch(() => undefined);
+    } catch {
+      // app.request may reject with the abort — that's fine; the point is the lock.
+    }
+
+    // Give the finally{} a tick to run.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The lock must have been released: a subsequent turn is NOT 409.
+    const r2 = await a.request(`/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "second" }),
+    });
+    expect(r2.status).not.toBe(409);
+    expect(r2.status).toBe(200);
+  });
+});
+
+describe("idle session eviction (sweep)", () => {
+  function mgr() {
+    return new SessionManager({
+      store: new MemorySnapshotStore(),
+      modelResolver: resolverFor(scriptedModel([{ kind: "text", text: "x" }])),
+      evictAfterMs: 1000,
+    });
+  }
+
+  it("evicts an idle session, records+returns its snapshotId, leaves a fresh one intact", async () => {
+    const manager = mgr();
+    const idle = manager.create({ tenant: "alice", model: "mock/x", files: { "/a.txt": "keep" } });
+    const fresh = manager.create({ tenant: "alice", model: "mock/x" });
+
+    // Force the idle session's lastUsed far into the past via the test seam.
+    manager._setLastUsedForTest(idle, Date.now() - 60_000);
+
+    const { evicted } = await manager.sweep();
+    expect(evicted).toContain(idle);
+    expect(evicted).not.toContain(fresh);
+
+    // The fresh session is still usable.
+    expect(() => manager.get(fresh, "alice")).not.toThrow();
+    // The evicted session is gone -> get throws 404.
+    expect(() => manager.get(idle, "alice")).toThrow(SessionError);
+  });
+
+  it("sweep result maps evicted sessionId -> snapshotId, and that snapshot is restorable by the same tenant", async () => {
+    const manager = mgr();
+    const idle = manager.create({ tenant: "alice", model: "mock/x", files: { "/secret.txt": "alice-only" } });
+    manager._setLastUsedForTest(idle, Date.now() - 60_000);
+
+    const result = await manager.sweep();
+    const snapId = result.snapshots[idle];
+    expect(typeof snapId).toBe("string");
+    expect(snapId).toBeTruthy();
+
+    // The same tenant can restore from the recorded snapshot (owner preserved).
+    const restoredId = await manager.restore({ tenant: "alice", snapshotId: snapId!, model: "mock/x" });
+    expect(restoredId).toBeTruthy();
+    const entry = manager.get(restoredId, "alice");
+    expect(entry).toBeDefined();
+  });
+
+  it("never evicts a busy session (turn in flight)", async () => {
+    const manager = mgr();
+    const busy = manager.create({ tenant: "alice", model: "mock/x" });
+    manager._setLastUsedForTest(busy, Date.now() - 60_000);
+    expect(manager.tryAcquireTurn(busy, "alice")).toBe(true); // mark busy
+
+    const { evicted } = await manager.sweep();
+    expect(evicted).not.toContain(busy);
+    expect(() => manager.get(busy, "alice")).not.toThrow();
+  });
+
+  it("startSweeper returns a stoppable handle and sweeps on its interval", async () => {
+    const manager = mgr();
+    const idle = manager.create({ tenant: "alice", model: "mock/x" });
+    manager._setLastUsedForTest(idle, Date.now() - 60_000);
+
+    const handle = manager.startSweeper(5);
+    await new Promise((r) => setTimeout(r, 30));
+    handle.stop();
+    expect(() => manager.get(idle, "alice")).toThrow(SessionError);
+  });
+});
+
+describe("model allow-list (example-level policy)", () => {
+  const ALLOWED = new Set(["anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4-5"]);
+  function allowlistResolver(scripted: LanguageModel): ModelResolver {
+    return (id: string) => {
+      if (!ALLOWED.has(id)) {
+        throw new SessionError(403, "model_not_allowed", `model not allowed: ${id}`);
+      }
+      return scripted;
+    };
+  }
+
+  it("POST /v1/sessions with a disallowed model -> 403 model_not_allowed", async () => {
+    const manager = new SessionManager({
+      modelResolver: allowlistResolver(scriptedModel([{ kind: "text", text: "x" }])),
+    });
+    const a = createApp({ manager });
+    const res = await a.request("/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "openai/gpt-4o" }),
+    });
+    expect(res.status).toBe(403);
+    const json = (await res.json()) as { error: { code: string } };
+    expect(json.error.code).toBe("model_not_allowed");
+  });
+
+  it("POST /v1/sessions with an allowed model -> 200", async () => {
+    const manager = new SessionManager({
+      modelResolver: allowlistResolver(scriptedModel([{ kind: "text", text: "x" }])),
+    });
+    const a = createApp({ manager });
+    const res = await a.request("/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "anthropic/claude-sonnet-4.5" }),
+    });
+    expect(res.status).toBe(200);
   });
 });
 
