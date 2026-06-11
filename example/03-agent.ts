@@ -16,9 +16,17 @@
  */
 import { createSession } from "@ork/harness";
 import { MemorySnapshotStore } from "@ork/kernel";
+import { anthropic } from "@ai-sdk/anthropic";
 
-// "provider/model" string → resolved by the AI Gateway. Swap as you like.
-const MODEL = "anthropic/claude-sonnet-4-5";
+// Two routes to a model:
+//  - ANTHROPIC_API_KEY  → direct Anthropic via @ai-sdk/anthropic (used first)
+//  - AI_GATEWAY_API_KEY → "provider/model" string via the Vercel AI Gateway
+const MODEL = process.env.ANTHROPIC_API_KEY
+  ? anthropic("claude-sonnet-4-6")
+  : "anthropic/claude-sonnet-4.5";
+const MODEL_LABEL = process.env.ANTHROPIC_API_KEY
+  ? "claude-sonnet-4-6 (direct Anthropic)"
+  : "anthropic/claude-sonnet-4.5 (AI Gateway)";
 
 async function main() {
   if (!process.env.AI_GATEWAY_API_KEY && !process.env.ANTHROPIC_API_KEY) {
@@ -39,7 +47,7 @@ async function main() {
     maxSteps: 20, // cap the tool loop
   });
 
-  console.log(`=== ork agent session (model: ${MODEL}) ===\n`);
+  console.log(`=== ork agent session (model: ${MODEL_LABEL}) ===\n`);
 
   const prompt =
     "Read /workspace/data.csv, compute the average score with awk or a shell " +
