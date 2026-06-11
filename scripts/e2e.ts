@@ -18,98 +18,12 @@ import { createApp } from "@ork/server";
 import { SessionManager } from "@ork/server";
 import { MemorySnapshotStore } from "@ork/kernel";
 import type { LanguageModel } from "ai";
-import type {
-  LanguageModelV2,
-  LanguageModelV2StreamPart,
-  LanguageModelV2FinishReason,
-} from "@ai-sdk/provider";
-
-// ---- scripted mock model ---------------------------------------------------
-// Mirrors the pattern of packages/server/test/mock-model.ts (which wraps
-// ai/test's MockLanguageModelV2). We re-implement the tiny LanguageModelV2
-// surface here directly rather than importing ai/test, because ai/test eagerly
-// pulls in @ai-sdk/provider-utils/test -> vitest, which cannot load outside the
-// vitest runner. This still drives the exact same wire path through the server.
-
-type ScriptStep =
-  | { kind: "text"; text: string; finishReason?: LanguageModelV2FinishReason }
-  | {
-      kind: "tools";
-      text?: string;
-      calls: Array<{ toolName: string; input: unknown; toolCallId?: string }>;
-      finishReason?: LanguageModelV2FinishReason;
-    };
-
-const USAGE = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
-
-function streamFromParts(
-  parts: LanguageModelV2StreamPart[],
-): ReadableStream<LanguageModelV2StreamPart> {
-  return new ReadableStream<LanguageModelV2StreamPart>({
-    start(controller) {
-      for (const p of parts) controller.enqueue(p);
-      controller.close();
-    },
-  });
-}
-
-function stepToParts(step: ScriptStep, idx: number): LanguageModelV2StreamPart[] {
-  const parts: LanguageModelV2StreamPart[] = [{ type: "stream-start", warnings: [] }];
-  if (step.kind === "text") {
-    const id = `t${idx}`;
-    parts.push(
-      { type: "text-start", id },
-      { type: "text-delta", id, delta: step.text },
-      { type: "text-end", id },
-      { type: "finish", finishReason: step.finishReason ?? "stop", usage: USAGE },
-    );
-    return parts;
-  }
-  if (step.text) {
-    const id = `t${idx}`;
-    parts.push(
-      { type: "text-start", id },
-      { type: "text-delta", id, delta: step.text },
-      { type: "text-end", id },
-    );
-  }
-  step.calls.forEach((c, i) => {
-    parts.push({
-      type: "tool-call",
-      toolCallId: c.toolCallId ?? `call-${idx}-${i}`,
-      toolName: c.toolName,
-      input: JSON.stringify(c.input),
-    });
-  });
-  parts.push({ type: "finish", finishReason: step.finishReason ?? "tool-calls", usage: USAGE });
-  return parts;
-}
-
-/**
- * Build a LanguageModelV2 that emits `script` steps in order across doStream
- * calls. `delayMs` (optional) holds the turn open for that long before emitting
- * — used to keep the per-session turn lock reliably held during the overlap test.
- */
-function scriptedModel(script: ScriptStep[], delayMs = 0): LanguageModelV2 {
-  let call = 0;
-  const model: LanguageModelV2 = {
-    specificationVersion: "v2",
-    provider: "mock-provider",
-    modelId: "mock-model-id",
-    supportedUrls: {},
-    doGenerate: async () => {
-      throw new Error("doGenerate not used by the streaming harness");
-    },
-    doStream: async () => {
-      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
-      const step = script[call] ?? { kind: "text", text: "" };
-      const parts = stepToParts(step as ScriptStep, call);
-      call += 1;
-      return { stream: streamFromParts(parts) };
-    },
-  };
-  return model;
-}
+// Single source of truth for the scripted mock model lives in the example
+// package; tsx resolves the .ts behind this .js specifier. It re-implements the
+// tiny LanguageModelV2 streaming surface directly (rather than importing
+// ai/test, which eagerly pulls in vitest and cannot load outside the runner),
+// so the same wire path is exercised here over real HTTP.
+import { scriptedModel, type Step } from "../example/mock-model.js";
 
 // ---- assertion harness -----------------------------------------------------
 
@@ -136,22 +50,20 @@ function assert(name: string, ok: boolean, detail?: string): void {
  *  3. Bash: read README.md back (cat)
  *  4. final assistant text "Project initialized."
  */
-function setupProjectScript(): ScriptStep[] {
+function setupProjectScript(): Step[] {
   return [
     {
-      kind: "tools",
-      calls: [
+      toolCalls: [
         {
-          toolName: "Bash",
+          tool: "Bash",
           input: { command: 'mkdir -p /work && echo "v1" > /work/version.txt && ls /work' },
         },
       ],
     },
     {
-      kind: "tools",
-      calls: [
+      toolCalls: [
         {
-          toolName: "Write",
+          tool: "Write",
           input: {
             file_path: "/work/README.md",
             content: "# Project\n\nInitialized by ork e2e.\n",
@@ -160,10 +72,9 @@ function setupProjectScript(): ScriptStep[] {
       ],
     },
     {
-      kind: "tools",
-      calls: [{ toolName: "Bash", input: { command: "cat /work/README.md" } }],
+      toolCalls: [{ tool: "Bash", input: { command: "cat /work/README.md" } }],
     },
-    { kind: "text", text: "Project initialized." },
+    { text: "Project initialized." },
   ];
 }
 
@@ -214,7 +125,7 @@ async function main(): Promise<void> {
     // gets the fast scripted multi-tool agent.
     modelResolver: (modelId: string): LanguageModel =>
       modelId === "slow/agent"
-        ? scriptedModel([{ kind: "text", text: "slow done." }], 300)
+        ? scriptedModel([{ text: "slow done." }], 300)
         : scriptedModel(setupProjectScript()),
   });
 

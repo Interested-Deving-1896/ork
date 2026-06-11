@@ -62,8 +62,12 @@ function stepToParts(step: Step, idx: number): LanguageModelV2StreamPart[] {
 
 /**
  * Build a LanguageModelV2 that emits `steps` in order across doStream calls.
+ *
+ * `delayMs` (optional, default 0) holds each turn open for that long before
+ * emitting its stream — useful to keep a per-session turn lock reliably in
+ * flight while an overlapping request arrives (see scripts/e2e.ts).
  */
-export function scriptedModel(steps: Step[]): LanguageModelV2 {
+export function scriptedModel(steps: Step[], delayMs = 0): LanguageModelV2 {
   let call = 0;
   return {
     specificationVersion: "v2",
@@ -74,6 +78,7 @@ export function scriptedModel(steps: Step[]): LanguageModelV2 {
       throw new Error("doGenerate not used by the streaming harness");
     },
     doStream: async () => {
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
       const step: Step = steps[call] ?? { text: "" };
       const parts = stepToParts(step, call);
       call += 1;
