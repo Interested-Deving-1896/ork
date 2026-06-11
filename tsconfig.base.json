@@ -3,8 +3,17 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM", "DOM.AsyncIterable"],
     "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@ork/harness": ["packages/harness/src/index.ts"],
+      "@ork/kernel": ["packages/kernel/src/index.ts"],
+      "@ork/server": ["packages/server/src/index.ts"],
+      "@ork/shell": ["packages/shell/src/index.ts"],
+      "@ork/store-s3": ["packages/store-s3/src/index.ts"],
+      "@ork/tools": ["packages/tools/src/index.ts"]
+    },
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,

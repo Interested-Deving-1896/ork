@@ -100,7 +100,7 @@ export class FakeS3 {
     if (method === "GET") {
       const existing = this.objects.get(key);
       if (!existing) return new Response("NoSuchKey", { status: 404 });
-      return new Response(existing.body, {
+      return new Response(toArrayBuffer(existing.body), {
         status: 200,
         headers: this.opts.noEtag ? {} : { etag: existing.etag },
       });
@@ -160,10 +160,16 @@ function escapeXml(s: string): string {
 
 async function readBody(body: RequestInit["body"]): Promise<Uint8Array> {
   if (body == null) return new Uint8Array();
-  if (body instanceof Uint8Array) return body;
+  if (body instanceof Uint8Array) return new Uint8Array(toArrayBuffer(body));
   if (typeof body === "string") return new TextEncoder().encode(body);
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
   // Fallback : Request/ReadableStream → on passe par Response pour drainer.
   return new Uint8Array(await new Response(body).arrayBuffer());
+}
+
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+  const bytes = new Uint8Array(data.byteLength);
+  bytes.set(data);
+  return bytes.buffer;
 }
