@@ -49,6 +49,9 @@ export interface SessionConfig {
    * Workspace externe (FS partagé, géré par Workspace.open/commit). Mutuellement
    * exclusif avec `files`. La config kernel (mounts/network/limits/fetchImpl)
    * de cette SessionConfig est ignorée : elle a été fixée à Workspace.open.
+   * Persistance : utiliser `workspace.commit()` (FS-only + avance du pointeur) —
+   * PAS `session.snapshot()`, qui écrit un snapshot couplé FS+messages sans
+   * jamais avancer le pointeur du workspace.
    */
   workspace?: Workspace;
   /**
